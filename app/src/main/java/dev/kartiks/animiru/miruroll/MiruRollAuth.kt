@@ -66,6 +66,7 @@ class MiruRollAuth(
     fun getRefreshTokenFromWebView(): String? {
         return runCatching {
             val cookieManager = CookieManager.getInstance() ?: return null
+            cookieManager.flush()
             val domains = listOf(
                 "https://www.crunchyroll.com",
                 "https://sso.crunchyroll.com",
@@ -90,10 +91,7 @@ class MiruRollAuth(
     fun getAccessToken(forceRefresh: Boolean = false): String {
         val cachedToken = preferences.getString(KEY_ACCESS_TOKEN, null)
         val expiryTime = preferences.getLong(KEY_TOKEN_EXPIRY, 0L)
-
-        if (!forceRefresh && !cachedToken.isNullOrBlank() && System.currentTimeMillis() < expiryTime) {
-            return cachedToken
-        }
+        val isCachedGuest = preferences.getBoolean(KEY_IS_GUEST, false)
 
         val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
             preferences.edit().putString(KEY_DEVICE_ID, it).apply()
@@ -105,11 +103,27 @@ class MiruRollAuth(
         val userEmail = preferences.getString(PREF_EMAIL, null)?.trim()
         val userPass = preferences.getString(PREF_PASSWORD, null)
 
+        val lastWebViewRt = preferences.getString(KEY_LAST_WEBVIEW_RT, null)
+        val hasNewWebViewSession = !webViewRefreshToken.isNullOrBlank() && webViewRefreshToken != lastWebViewRt
+
+        val hasUserCredentials = !webViewRefreshToken.isNullOrBlank() ||
+            !customRefreshToken.isNullOrBlank() ||
+            (!userEmail.isNullOrBlank() && !userPass.isNullOrBlank()) ||
+            (!storedRefreshToken.isNullOrBlank() && !isCachedGuest)
+
+        if ((isCachedGuest && hasUserCredentials) || hasNewWebViewSession) {
+            Log.d(TAG, "Cached token is guest or new session detected, forcing token exchange")
+        } else if (!forceRefresh && !cachedToken.isNullOrBlank() && System.currentTimeMillis() < expiryTime) {
+            return cachedToken
+        }
+
+        var isGuest = false
         val finalResponse = when {
             !webViewRefreshToken.isNullOrBlank() -> {
                 Log.d(TAG, "Authenticating using WebView etp_rt cookie")
                 runCatching { requestWebCookieToken(webViewRefreshToken, deviceId) }.getOrElse { e ->
                     Log.w(TAG, "WebView token exchange failed, falling back to guest", e)
+                    isGuest = true
                     requestGuestToken(deviceId)
                 }
             }
@@ -117,13 +131,15 @@ class MiruRollAuth(
                 Log.d(TAG, "Authenticating using custom refresh token")
                 runCatching { requestRefreshToken(customRefreshToken, deviceId) }.getOrElse { e ->
                     Log.w(TAG, "Custom refresh token failed, falling back to guest", e)
+                    isGuest = true
                     requestGuestToken(deviceId)
                 }
             }
-            !storedRefreshToken.isNullOrBlank() -> {
+            !storedRefreshToken.isNullOrBlank() && !isCachedGuest -> {
                 Log.d(TAG, "Authenticating using stored refresh token")
                 runCatching { requestRefreshToken(storedRefreshToken, deviceId) }.getOrElse { e ->
                     Log.w(TAG, "Stored refresh token failed, falling back to guest", e)
+                    isGuest = true
                     requestGuestToken(deviceId)
                 }
             }
@@ -131,11 +147,13 @@ class MiruRollAuth(
                 Log.d(TAG, "Authenticating using user credentials")
                 runCatching { requestPasswordSignIn(userEmail, userPass, deviceId) }.getOrElse { e ->
                     Log.w(TAG, "Password auth failed, falling back to guest", e)
+                    isGuest = true
                     requestGuestToken(deviceId)
                 }
             }
             else -> {
                 Log.d(TAG, "Authenticating as guest")
+                isGuest = true
                 requestGuestToken(deviceId)
             }
         }
@@ -145,7 +163,11 @@ class MiruRollAuth(
         val editor = preferences.edit()
             .putString(KEY_ACCESS_TOKEN, finalResponse.access_token)
             .putLong(KEY_TOKEN_EXPIRY, expiresAt)
+            .putBoolean(KEY_IS_GUEST, isGuest)
 
+        if (!webViewRefreshToken.isNullOrBlank()) {
+            editor.putString(KEY_LAST_WEBVIEW_RT, webViewRefreshToken)
+        }
         if (!finalResponse.refresh_token.isNullOrBlank()) {
             editor.putString(KEY_REFRESH_TOKEN, finalResponse.refresh_token)
         }
@@ -262,6 +284,8 @@ class MiruRollAuth(
             .remove(KEY_TOKEN_EXPIRY)
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_ACCOUNT_ID)
+            .remove(KEY_IS_GUEST)
+            .remove(KEY_LAST_WEBVIEW_RT)
             .apply()
     }
 
@@ -282,6 +306,8 @@ class MiruRollAuth(
         private const val KEY_REFRESH_TOKEN = "cr_refresh_token"
         private const val KEY_ACCOUNT_ID = "cr_account_id"
         private const val KEY_DEVICE_ID = "cr_device_id"
+        private const val KEY_IS_GUEST = "cr_is_guest"
+        private const val KEY_LAST_WEBVIEW_RT = "cr_last_webview_rt"
 
         const val PREF_EMAIL = "cr_pref_email"
         const val PREF_PASSWORD = "cr_pref_password"

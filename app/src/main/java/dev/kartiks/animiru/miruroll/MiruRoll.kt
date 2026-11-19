@@ -45,7 +45,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     override val id: Long = 7463514907068706782L
     override val versionId = 1
 
-    override fun getHomeUrl(): String = "https://www.crunchyroll.com/login"
+    override fun getHomeUrl(): String = "https://www.crunchyroll.com"
 
     override val supportsLatest = true
     override val supportsRelatedAnime = false
