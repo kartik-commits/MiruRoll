@@ -26,9 +26,11 @@ import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -231,23 +233,57 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     // ============================ Playback & Widevine DRM =============================
 
-    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val qualities = listOf(
-            Triple("Auto (Adaptive)", null, true),
-            Triple("1080p", 1080, false),
-            Triple("720p", 720, false),
-            Triple("480p", 480, false),
-            Triple("360p", 360, false),
-            Triple("240p", 240, false),
-        )
+    private val resolutionCache = ConcurrentHashMap<String, List<Int>>()
+    private val requestMutex = Mutex()
+    private var lastRequestTime = 0L
+    private val failedTargets = ConcurrentHashMap<String, Long>()
+    private val playbackCache = ConcurrentHashMap<String, Pair<String, PlaybackV4Response>>()
 
-        val videoList = qualities.map { (title, res, isPref) ->
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(episode.url)
+        }.getOrNull()
+
+        val parsedHeights = if (epData != null) {
+            val cacheKey = epData.versionGuid ?: epData.episodeId
+            resolutionCache[cacheKey] ?: runCatching {
+                val (_, playback) = getPlayback(epData)
+                val dashUrl = playback.url.ifBlank {
+                    playback.hardSubs?.get("en-US")?.url
+                        ?: playback.hardSubs?.get("none")?.url
+                        ?: playback.hardSubs?.values?.firstOrNull()?.url
+                }
+                if (!dashUrl.isNullOrBlank()) {
+                    val heights = fetchDashResolutions(dashUrl)
+                    if (heights.isNotEmpty()) {
+                        resolutionCache[cacheKey] = heights
+                        heights
+                    } else null
+                } else null
+            }.getOrNull()
+        } else null
+
+        val heights = parsedHeights?.takeIf { it.isNotEmpty() } ?: DEFAULT_QUALITIES
+
+        val videoList = mutableListOf(
             Video(
                 videoUrl = episode.url,
-                videoTitle = title,
-                resolution = res,
-                preferred = isPref,
+                videoTitle = "Auto (Adaptive)",
+                resolution = null,
+                preferred = true,
                 initialized = false,
+            ),
+        )
+
+        heights.forEach { h ->
+            videoList.add(
+                Video(
+                    videoUrl = episode.url,
+                    videoTitle = "${h}p",
+                    resolution = h,
+                    preferred = false,
+                    initialized = false,
+                ),
             )
         }
 
@@ -259,16 +295,37 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         )
     }
 
-    private val requestMutex = Mutex()
-    private var lastRequestTime = 0L
-    private val failedTargets = ConcurrentHashMap<String, Long>()
-    private val playbackCache = ConcurrentHashMap<String, Pair<String, PlaybackV4Response>>()
+    private suspend fun fetchDashResolutions(dashUrl: String): List<Int> = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(dashUrl)
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", MiruRollAuth.WEB_USER_AGENT,
+                    "Authorization", "Bearer ${auth.getAccessToken()}",
+                ),
+            )
+            .get()
+            .build()
 
-    override suspend fun resolveVideo(video: Video): Video {
-        val epData = runCatching {
-            json.decodeFromString<MiruEpisodeData>(video.videoUrl)
-        }.getOrNull() ?: return video
+        val response = client.newCall(request).execute()
+        response.use { r ->
+            if (!r.isSuccessful) return@use emptyList()
+            val xml = r.body.string()
+            parseMpdResolutions(xml)
+        }
+    }
 
+    private fun parseMpdResolutions(xml: String): List<Int> {
+        return Regex("""\bheight=["'](\d+)["']""")
+            .findAll(xml)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 144..4320 }
+            .distinct()
+            .sortedDescending()
+            .toList()
+    }
+
+    private suspend fun getPlayback(epData: MiruEpisodeData): Pair<String, PlaybackV4Response> {
         val isSpecificDub = !epData.versionGuid.isNullOrBlank()
         val targetVersion = if (isSpecificDub) {
             epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
@@ -336,11 +393,12 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                         if (r.isSuccessful) {
                             val body = r.body.string()
                             if (body.isNotBlank()) {
-                                parsed = json.decodeFromString<PlaybackV4Response>(body)
+                                val decoded = json.decodeFromString<PlaybackV4Response>(body)
+                                parsed = decoded
                                 resolvedTargetId = targetId
-                                playbackCache[targetId] = Pair(targetId, parsed!!)
-                                if (isSpecificDub && epData.versionGuid != null) {
-                                    playbackCache[epData.versionGuid] = Pair(targetId, parsed!!)
+                                playbackCache[targetId] = Pair(targetId, decoded)
+                                if (isSpecificDub && !epData.versionGuid.isNullOrBlank()) {
+                                    playbackCache[epData.versionGuid] = Pair(targetId, decoded)
                                 }
                                 failedTargets.remove(targetId)
                             }
@@ -361,14 +419,28 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             }
         }
 
-        if (parsed == null) {
-            throw IllegalStateException("Audio dub is unavailable or region-locked")
-        }
-
-        val nonNullParsed = parsed!!
+        val nonNullParsed = parsed ?: throw IllegalStateException("Audio dub is unavailable or region-locked")
         if (!isSpecificDub && epData.episodeId.isNotBlank()) {
             playbackCache[epData.episodeId] = Pair(resolvedTargetId, nonNullParsed)
         }
+
+        return Pair(resolvedTargetId, nonNullParsed)
+    }
+
+    override suspend fun resolveVideo(video: Video): Video {
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(video.videoUrl)
+        }.getOrNull() ?: return video
+
+        val (resolvedTargetId, nonNullParsed) = getPlayback(epData)
+
+        val isSpecificDub = !epData.versionGuid.isNullOrBlank()
+        val targetVersion = if (isSpecificDub) {
+            epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
+        } else {
+            epData.availableVersions.firstOrNull { it.original } ?: epData.availableVersions.firstOrNull()
+        }
+
         val dashUrl = nonNullParsed.url.ifBlank {
             nonNullParsed.hardSubs?.get("en-US")?.url
                 ?: nonNullParsed.hardSubs?.get("none")?.url
@@ -534,5 +606,6 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     private companion object {
         private const val TAG = "MiruRoll"
         private const val PAGE_SIZE = 24
+        private val DEFAULT_QUALITIES = listOf(1080, 720, 480, 360, 240)
     }
 }
