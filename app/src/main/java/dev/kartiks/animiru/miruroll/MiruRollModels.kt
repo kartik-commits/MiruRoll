@@ -234,3 +234,75 @@ data class MiruEpisodeData(
     val streamsLink: String? = null,
     val availableVersions: List<EpisodeVersion> = emptyList(),
 )
+
+@Serializable
+data class SavePlayheadBody(
+    @SerialName("content_id")
+    val contentId: String,
+    val playhead: Long,
+)
+
+@Serializable
+data class PlayheadResponse(
+    val total: Int = 0,
+    val data: List<CrPlayhead> = emptyList(),
+)
+
+@Serializable
+data class CrPlayhead(
+    @SerialName("content_id")
+    val contentId: String,
+    val playhead: Long = 0L,
+    @SerialName("fully_watched")
+    val fullyWatched: Boolean = false,
+    @SerialName("last_modified")
+    val lastModified: String? = null,
+)
+
+@Serializable
+data class WatchHistoryResponse(
+    val total: Int = 0,
+    val data: List<CrWatchHistoryItem> = emptyList(),
+)
+
+@Serializable
+data class CrWatchHistoryItem(
+    val id: String,
+    @SerialName("date_played")
+    val datePlayed: String? = null,
+    @SerialName("parent_id")
+    val parentId: String? = null,
+    @SerialName("parent_type")
+    val parentType: String? = null,
+    val playhead: Long = 0L,
+    @SerialName("fully_watched")
+    val fullyWatched: Boolean = false,
+    val panel: CrWatchHistoryPanel? = null,
+)
+
+@Serializable
+data class CrWatchHistoryPanel(
+    val id: String = "",
+    val type: String = "",
+    val title: String = "",
+    @SerialName("episode_metadata")
+    val episodeMetadata: CrWatchHistoryEpisodeMetadata? = null,
+)
+
+@Serializable
+data class CrWatchHistoryEpisodeMetadata(
+    @SerialName("series_id")
+    val seriesId: String = "",
+    @SerialName("series_title")
+    val seriesTitle: String = "",
+    @SerialName("season_id")
+    val seasonId: String = "",
+    @SerialName("season_title")
+    val seasonTitle: String = "",
+    val episode: String = "",
+    @SerialName("episode_number")
+    val episodeNumber: Float = 0f,
+    @SerialName("duration_ms")
+    val durationMs: Long = 0L,
+)
+

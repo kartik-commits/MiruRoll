@@ -211,6 +211,8 @@ class MiruRollAuth(
         }
         val tokenAccountId = finalResponse.account_id
             ?: extractJwtClaim(finalResponse.access_token, "account_id")
+            ?: extractJwtClaim(finalResponse.access_token, "etp_user_id")
+            ?: extractJwtClaim(finalResponse.access_token, "profile_id")
             ?: extractJwtClaim(finalResponse.access_token, "sub")
         if (!tokenAccountId.isNullOrBlank()) {
             editor.putString(KEY_ACCOUNT_ID, tokenAccountId)
@@ -498,6 +500,8 @@ class MiruRollAuth(
             }
             val newAccountId = tokenResponse.account_id
                 ?: extractJwtClaim(tokenResponse.access_token, "account_id")
+                ?: extractJwtClaim(tokenResponse.access_token, "etp_user_id")
+                ?: extractJwtClaim(tokenResponse.access_token, "profile_id")
                 ?: extractJwtClaim(tokenResponse.access_token, "sub")
             if (!newAccountId.isNullOrBlank()) {
                 editor.putString(KEY_ACCOUNT_ID, newAccountId)
@@ -564,6 +568,7 @@ class MiruRollAuth(
     }
 
     fun isUserLoggedIn(): Boolean {
+        if (preferences.getBoolean(KEY_IS_GUEST, false)) return false
         val webViewRt = getRefreshTokenFromWebView()
         val email = preferences.getString(PREF_EMAIL, null)
         val customRt = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
@@ -583,6 +588,142 @@ class MiruRollAuth(
             .remove(KEY_PROFILE_NAME)
             .remove(KEY_PROFILES_JSON)
             .apply()
+    }
+
+    fun getAccountId(): String? {
+        val stored = preferences.getString(KEY_ACCOUNT_ID, null)
+        if (!stored.isNullOrBlank()) return stored
+        val token = runCatching { getAccessToken() }.getOrNull() ?: return null
+        return extractJwtClaim(token, "account_id")
+            ?: extractJwtClaim(token, "etp_user_id")
+            ?: extractJwtClaim(token, "profile_id")
+            ?: extractJwtClaim(token, "sub")
+    }
+
+    fun deleteWatchHistory(episodeId: String): Result<Unit> = runCatching {
+        val accountId = getAccountId() ?: throw IllegalStateException("No account ID available")
+        val token = getAccessToken()
+        val url = "https://beta-api.crunchyroll.com/content/v2/$accountId/watch-history/$episodeId"
+        val req = Request.Builder()
+            .url(url)
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $token",
+                ),
+            )
+            .delete()
+            .build()
+        val resp = authClient.newCall(req).execute()
+        if (!resp.isSuccessful && resp.code != 204 && resp.code != 404) {
+            val err = resp.body.string()
+            throw IllegalStateException("Failed to delete watch history (HTTP ${resp.code}): $err")
+        }
+    }
+
+    fun savePlayhead(episodeId: String, playheadSeconds: Long): Result<Unit> = runCatching {
+        val accountId = getAccountId() ?: throw IllegalStateException("No account ID available")
+        val token = getAccessToken()
+        val url = "https://beta-api.crunchyroll.com/content/v2/$accountId/playheads"
+        val payload = json.encodeToString(SavePlayheadBody(contentId = episodeId, playhead = playheadSeconds))
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val body = payload.toRequestBody(mediaType)
+        val req = Request.Builder()
+            .url(url)
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $token",
+                    "Content-Type", "application/json",
+                ),
+            )
+            .post(body)
+            .build()
+        val resp = authClient.newCall(req).execute()
+        if (!resp.isSuccessful && resp.code != 204) {
+            val err = resp.body.string()
+            throw IllegalStateException("Failed to save playhead (HTTP ${resp.code}): $err")
+        }
+    }
+
+    fun markAsWatched(episodeId: String): Result<Unit> = runCatching {
+        val accountId = getAccountId() ?: throw IllegalStateException("No account ID available")
+        val token = getAccessToken()
+        val url = "https://beta-api.crunchyroll.com/content/v2/discover/$accountId/mark_as_watched/$episodeId"
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val body = "".toRequestBody(mediaType)
+        val req = Request.Builder()
+            .url(url)
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $token",
+                    "Content-Type", "application/json",
+                ),
+            )
+            .post(body)
+            .build()
+        val resp = authClient.newCall(req).execute()
+        if (!resp.isSuccessful && resp.code != 204) {
+            val err = resp.body.string()
+            throw IllegalStateException("Failed to mark as watched (HTTP ${resp.code}): $err")
+        }
+    }
+
+    fun getPlayheads(contentIds: List<String>): Map<String, CrPlayhead> {
+        if (contentIds.isEmpty()) return emptyMap()
+        return runCatching {
+            val accountId = getAccountId() ?: return emptyMap()
+            val token = getAccessToken()
+            contentIds.chunked(50).flatMap { chunk ->
+                val idsParam = chunk.joinToString(",")
+                val url = "https://beta-api.crunchyroll.com/content/v2/$accountId/playheads?content_ids=$idsParam"
+                val req = Request.Builder()
+                    .url(url)
+                    .headers(
+                        Headers.headersOf(
+                            "User-Agent", USER_AGENT,
+                            "Authorization", "Bearer $token",
+                        ),
+                    )
+                    .get()
+                    .build()
+                val resp = authClient.newCall(req).execute()
+                if (resp.isSuccessful) {
+                    val respBody = resp.body.string()
+                    val decoded = json.decodeFromString<PlayheadResponse>(respBody)
+                    decoded.data
+                } else {
+                    emptyList()
+                }
+            }.associateBy { it.contentId }
+        }.getOrDefault(emptyMap())
+    }
+
+    fun getPlayhead(episodeId: String): CrPlayhead? {
+        return getPlayheads(listOf(episodeId))[episodeId]
+    }
+
+    fun fetchWatchHistory(pageSize: Int = 25): Result<List<CrWatchHistoryItem>> = runCatching {
+        val accountId = getAccountId() ?: throw IllegalStateException("No account ID available")
+        val token = getAccessToken()
+        val url = "https://beta-api.crunchyroll.com/content/v2/$accountId/watch-history?page_size=$pageSize"
+        val req = Request.Builder()
+            .url(url)
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $token",
+                ),
+            )
+            .get()
+            .build()
+        val resp = authClient.newCall(req).execute()
+        val body = resp.body.string()
+        if (!resp.isSuccessful) {
+            throw IllegalStateException("Failed to fetch watch history (HTTP ${resp.code}): $body")
+        }
+        json.decodeFromString<WatchHistoryResponse>(body).data
     }
 
     companion object {

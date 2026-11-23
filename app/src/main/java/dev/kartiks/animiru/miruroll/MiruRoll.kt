@@ -8,6 +8,7 @@ import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimeRelation
@@ -26,11 +27,14 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -60,6 +64,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         isLenient = true
         explicitNulls = false
     }
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val preferences: SharedPreferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
@@ -207,6 +213,18 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             val seasonId = anime.url.removePrefix("/season/")
             val resp = client.newCall(GET("$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=en-US")).execute()
             val parsedEpisodes = json.decodeFromString<EpisodesResponse>(resp.body.string())
+
+            val allCandidateIds = parsedEpisodes.data.flatMap { ep ->
+                listOf(ep.id) + (ep.versions?.map { it.guid } ?: emptyList())
+            }.distinct()
+
+            val shouldSyncHistory = preferences.getBoolean("cr_pref_sync_history", true) && auth.isUserLoggedIn()
+            val playheads = if (shouldSyncHistory) {
+                auth.getPlayheads(allCandidateIds)
+            } else {
+                emptyMap()
+            }
+
             parsedEpisodes.data.sortedBy { it.sequenceNumber }.map { ep ->
                 val versions = ep.versions ?: emptyList()
                 val origVersion = versions.firstOrNull { it.original } ?: versions.firstOrNull()
@@ -220,11 +238,21 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                     streamsLink = ep.streams_link,
                     availableVersions = versions,
                 )
+                val epCandidates = (listOf(ep.id) + versions.map { it.guid }).distinct()
+                val matchingPlayheads = epCandidates.mapNotNull { playheads[it] }
+                val crPlayhead = matchingPlayheads.firstOrNull { it.fullyWatched }
+                    ?: matchingPlayheads.maxByOrNull { it.playhead }
                 SEpisode.create().apply {
                     url = json.encodeToString(epData)
                     name = if (ep.episodeNumber > 0) "E${ep.episodeNumber.toInt()} - ${ep.title}" else ep.title
                     episode_number = ep.episodeNumber
                     scanlator = "Audio: ${ep.audioLocale}"
+                    if (crPlayhead != null) {
+                        memo = buildJsonObject {
+                            put("cr_playhead", JsonPrimitive(crPlayhead.playhead))
+                            put("cr_fully_watched", JsonPrimitive(crPlayhead.fullyWatched))
+                        }
+                    }
                 }
             }
         } else {
@@ -558,6 +586,156 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
 
+    // ============================ Playhead & Watch History Sync =============================
+
+    private val lastPlayheadSyncTime = ConcurrentHashMap<String, Long>()
+    private val lastPlayheadSyncPos = ConcurrentHashMap<String, Long>()
+    private val lastMarkedWatched = ConcurrentHashMap<String, Long>()
+
+    private fun getCandidateEpisodeIds(epData: MiruEpisodeData): List<String> {
+        val candidates = mutableListOf<String>()
+        if (epData.episodeId.isNotBlank()) candidates.add(epData.episodeId)
+        epData.versionGuid?.let { if (it.isNotBlank()) candidates.add(it) }
+        epData.mediaGuid?.removeSuffix("V")?.let { if (it.isNotBlank()) candidates.add(it) }
+        epData.availableVersions.forEach { v ->
+            if (v.guid.isNotBlank()) candidates.add(v.guid)
+            v.mediaGuid?.removeSuffix("V")?.let { if (it.isNotBlank()) candidates.add(it) }
+        }
+        return candidates.distinct()
+    }
+
+    fun getPlayhead(episodeUrl: String): Long {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return 0L
+        if (!auth.isUserLoggedIn()) return 0L
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(episodeUrl)
+        }.getOrNull() ?: return 0L
+        val candidateIds = getCandidateEpisodeIds(epData)
+        val playheads = auth.getPlayheads(candidateIds)
+        val best = playheads.values.firstOrNull { it.fullyWatched }
+            ?: playheads.values.maxByOrNull { it.playhead }
+        return best?.playhead ?: 0L
+    }
+
+    fun isEpisodeFullyWatched(episodeUrl: String): Boolean {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return false
+        if (!auth.isUserLoggedIn()) return false
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(episodeUrl)
+        }.getOrNull() ?: return false
+        val candidateIds = getCandidateEpisodeIds(epData)
+        val playheads = auth.getPlayheads(candidateIds)
+        return playheads.values.any { it.fullyWatched }
+    }
+
+    fun savePlayhead(episodeUrl: String, positionSeconds: Long, totalSeconds: Long, onComplete: Boolean) {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return
+        if (!auth.isUserLoggedIn()) return
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(episodeUrl)
+        }.getOrNull() ?: return
+
+        val epId = epData.episodeId
+        val candidateIds = getCandidateEpisodeIds(epData)
+        val now = System.currentTimeMillis()
+
+        if (onComplete) {
+            val lastWatchedTime = lastMarkedWatched[epId] ?: 0L
+            if (now - lastWatchedTime < 30_000L) {
+                return
+            }
+            lastMarkedWatched[epId] = now
+            candidateIds.forEach { lastMarkedWatched[it] = now }
+        } else {
+            val lastTime = lastPlayheadSyncTime[epId] ?: 0L
+            val lastPos = lastPlayheadSyncPos[epId] ?: -1L
+            val timeElapsed = now - lastTime
+            val posDiff = Math.abs(positionSeconds - lastPos)
+            if (timeElapsed < 10_000L && posDiff < 5) {
+                return
+            }
+            lastPlayheadSyncTime[epId] = now
+            lastPlayheadSyncPos[epId] = positionSeconds
+        }
+
+        scope.launch {
+            try {
+                if (onComplete) {
+                    for (chunk in candidateIds.chunked(50)) {
+                        val idsParam = chunk.joinToString(",")
+                        Log.d(TAG, "Marking episode candidates $idsParam as watched on Crunchyroll")
+                        auth.markAsWatched(idsParam)
+                    }
+                } else if (positionSeconds > 0) {
+                    Log.d(TAG, "Saving playhead ${positionSeconds}s for episode $epId on Crunchyroll")
+                    auth.savePlayhead(epId, positionSeconds)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync playhead for $epId", e)
+            }
+        }
+    }
+
+    fun deletePlayhead(episodeUrl: String) {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return
+        if (!auth.isUserLoggedIn()) return
+        val epData = runCatching {
+            json.decodeFromString<MiruEpisodeData>(episodeUrl)
+        }.getOrNull() ?: return
+
+        val candidateIds = getCandidateEpisodeIds(epData)
+        candidateIds.forEach { id ->
+            lastMarkedWatched.remove(id)
+            lastPlayheadSyncTime.remove(id)
+            lastPlayheadSyncPos.remove(id)
+        }
+
+        scope.launch {
+            try {
+                for (chunk in candidateIds.chunked(50)) {
+                    val idsParam = chunk.joinToString(",")
+                    Log.d(TAG, "Deleting watch history for episodes $idsParam on Crunchyroll")
+                    auth.deleteWatchHistory(idsParam)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to delete watch history for ${epData.episodeId}", e)
+            }
+        }
+    }
+
+    fun setEpisodesSeen(episodeUrls: List<String>, seen: Boolean) {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return
+        if (!auth.isUserLoggedIn()) return
+        val allCandidateIds = episodeUrls.flatMap { url ->
+            val epData = runCatching { json.decodeFromString<MiruEpisodeData>(url) }.getOrNull()
+            if (epData != null) getCandidateEpisodeIds(epData) else emptyList()
+        }.distinct()
+        if (allCandidateIds.isEmpty()) return
+
+        allCandidateIds.forEach { id ->
+            lastMarkedWatched.remove(id)
+            lastPlayheadSyncTime.remove(id)
+            lastPlayheadSyncPos.remove(id)
+        }
+
+        scope.launch {
+            try {
+                for (chunk in allCandidateIds.chunked(50)) {
+                    val idsParam = chunk.joinToString(",")
+                    if (seen) {
+                        Log.d(TAG, "Batch marking episodes $idsParam as watched on Crunchyroll")
+                        auth.markAsWatched(idsParam)
+                    } else {
+                        Log.d(TAG, "Batch deleting watch history for episodes $idsParam on Crunchyroll")
+                        auth.deleteWatchHistory(idsParam)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to batch sync seen status ($seen)", e)
+            }
+        }
+    }
+
     // ============================== Settings ==============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -586,6 +764,13 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             summary = getAccountSummary()
         }
         screen.addPreference(accountPref)
+
+        SwitchPreferenceCompat(context).apply {
+            key = "cr_pref_sync_history"
+            title = "Sync Watch History"
+            summary = "Synchronize playhead positions and watched episodes with Crunchyroll"
+            setDefaultValue(true)
+        }.also(screen::addPreference)
 
         if (auth.isUserLoggedIn()) {
             val cachedProfiles = auth.getCachedProfiles()
