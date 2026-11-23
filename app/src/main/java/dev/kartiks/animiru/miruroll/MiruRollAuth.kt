@@ -3,14 +3,21 @@ package dev.kartiks.animiru.miruroll
 import android.content.SharedPreferences
 import android.util.Log
 import android.webkit.CookieManager
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.net.HttpURLConnection
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 class MiruRollAuth(
@@ -117,6 +124,23 @@ class MiruRollAuth(
             return cachedToken
         }
 
+        val activeProfileId = preferences.getString(KEY_PROFILE_ID, null)
+        val activePin = preferences.getString(PREF_PROFILE_PIN, null)?.trim()
+        val storedRt = preferences.getString(KEY_REFRESH_TOKEN, null)?.trim()
+            ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)?.trim()
+            ?: webViewRefreshToken
+
+        // Maintain the active profile across routine background token refreshes
+        if (!hasNewWebViewSession && !activeProfileId.isNullOrBlank() && !storedRt.isNullOrBlank() && !isCachedGuest) {
+            Log.d(TAG, "Refreshing access token for active profile: $activeProfileId")
+            val switchResult = switchProfile(activeProfileId, activePin)
+            if (switchResult.isSuccess) {
+                return preferences.getString(KEY_ACCESS_TOKEN, null)!!
+            } else {
+                Log.w(TAG, "Failed to refresh token for active profile, falling back to base auth", switchResult.exceptionOrNull())
+            }
+        }
+
         var isGuest = false
         val finalResponse = when {
             !webViewRefreshToken.isNullOrBlank() -> {
@@ -171,8 +195,16 @@ class MiruRollAuth(
         if (!finalResponse.refresh_token.isNullOrBlank()) {
             editor.putString(KEY_REFRESH_TOKEN, finalResponse.refresh_token)
         }
-        if (!finalResponse.account_id.isNullOrBlank()) {
-            editor.putString(KEY_ACCOUNT_ID, finalResponse.account_id)
+        val tokenAccountId = finalResponse.account_id
+            ?: extractJwtClaim(finalResponse.access_token, "account_id")
+            ?: extractJwtClaim(finalResponse.access_token, "sub")
+        if (!tokenAccountId.isNullOrBlank()) {
+            editor.putString(KEY_ACCOUNT_ID, tokenAccountId)
+        }
+        val tokenProfileId = finalResponse.profile_id
+            ?: extractJwtClaim(finalResponse.access_token, "profile_id")
+        if (!tokenProfileId.isNullOrBlank() && preferences.getString(KEY_PROFILE_ID, null).isNullOrBlank()) {
+            editor.putString(KEY_PROFILE_ID, tokenProfileId)
         }
         editor.apply()
 
@@ -270,6 +302,228 @@ class MiruRollAuth(
         return json.decodeFromString<TokenResponse>(body)
     }
 
+    fun fetchProfiles(): List<CrProfile> {
+        val token = getAccessToken()
+        val request = Request.Builder()
+            .url("https://beta-api.crunchyroll.com/accounts/v1/me/multiprofile")
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $token",
+                ),
+            )
+            .get()
+            .build()
+
+        val response = authClient.newCall(request).execute()
+        val body = response.body.string()
+        if (!response.isSuccessful) {
+            throw IllegalStateException("Failed to fetch profiles (HTTP ${response.code}): $body")
+        }
+
+        val parsed = json.decodeFromString<AllProfilesResponse>(body)
+        val profiles = parsed.profiles
+
+        preferences.edit().putString(KEY_PROFILES_JSON, body).apply()
+
+        val currentProfileId = preferences.getString(KEY_PROFILE_ID, null)
+        val active = profiles.find { it.isSelected }
+            ?: profiles.find { it.profileId == currentProfileId }
+            ?: profiles.firstOrNull()
+
+        if (active != null) {
+            preferences.edit()
+                .putString(KEY_PROFILE_ID, active.profileId)
+                .putString(KEY_PROFILE_NAME, active.profileName)
+                .apply()
+        }
+
+        return profiles
+    }
+
+    fun getCachedProfiles(): List<CrProfile> {
+        val jsonStr = preferences.getString(KEY_PROFILES_JSON, null) ?: return emptyList()
+        return runCatching {
+            json.decodeFromString<AllProfilesResponse>(jsonStr).profiles
+        }.getOrElse { emptyList() }
+    }
+
+    fun getActiveProfileName(): String {
+        return preferences.getString(KEY_PROFILE_NAME, null)
+            ?: getCachedProfiles().find { it.isSelected }?.profileName
+            ?: "Default Profile"
+    }
+
+    fun getActiveProfileId(): String? {
+        return preferences.getString(KEY_PROFILE_ID, null)
+            ?: getCachedProfiles().find { it.isSelected }?.profileId
+    }
+
+    fun getActiveProfilePreferredAudioLanguage(): String? {
+        val activeId = getActiveProfileId() ?: return null
+        return getCachedProfiles().find { it.profileId == activeId }?.preferredAudioLanguage
+    }
+
+    fun switchProfile(profileId: String, pin: String? = null): Result<CrProfile> {
+        return runCatching {
+            var refreshToken = preferences.getString(KEY_REFRESH_TOKEN, null)
+                ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
+
+            if (refreshToken.isNullOrBlank()) {
+                getAccessToken()
+                refreshToken = preferences.getString(KEY_REFRESH_TOKEN, null)
+                    ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
+            }
+
+            if (refreshToken.isNullOrBlank()) {
+                throw IllegalStateException("No refresh token available to switch profile. Please log in again.")
+            }
+
+            val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
+                preferences.edit().putString(KEY_DEVICE_ID, it).apply()
+            }
+
+            var passToken: String? = null
+            var accountId = preferences.getString(KEY_ACCOUNT_ID, null)
+            if (!pin.isNullOrBlank()) {
+                if (accountId.isNullOrBlank()) {
+                    val currentToken = preferences.getString(KEY_ACCESS_TOKEN, null)
+                    if (currentToken != null) {
+                        accountId = extractJwtClaim(currentToken, "account_id")
+                            ?: extractJwtClaim(currentToken, "sub")
+                    }
+                }
+                if (!accountId.isNullOrBlank()) {
+                    runCatching {
+                        passToken = requestProfilePassToken(accountId, profileId, pin)
+                    }
+                }
+            }
+
+            val formBody = FormBody.Builder()
+                .add("grant_type", "refresh_token_profile_id")
+                .add("refresh_token", refreshToken)
+                .add("profile_id", profileId)
+                .add("scope", "offline_access")
+                .add("device_id", deviceId)
+                .add("device_name", "Pixel")
+                .add("device_type", "Android")
+                .build()
+
+            val isWebViewSession = !getRefreshTokenFromWebView().isNullOrBlank()
+            val primaryAuth = if (isWebViewSession) WEB_BASIC_AUTH_HEADER else ANDROID_BASIC_AUTH_HEADER
+            val fallbackAuth = if (isWebViewSession) ANDROID_BASIC_AUTH_HEADER else WEB_BASIC_AUTH_HEADER
+
+            fun executeSwitch(authHeader: String): Response {
+                val req = Request.Builder()
+                    .url("https://beta-api.crunchyroll.com/auth/v1/token")
+                    .headers(
+                        Headers.headersOf(
+                            "User-Agent", if (authHeader == WEB_BASIC_AUTH_HEADER) WEB_USER_AGENT else USER_AGENT,
+                            "Authorization", authHeader,
+                            "Content-Type", "application/x-www-form-urlencoded",
+                        ),
+                    )
+                    .post(formBody)
+
+                if (!passToken.isNullOrBlank()) {
+                    req.addHeader("CrPassToken", passToken)
+                }
+                return authClient.newCall(req.build()).execute()
+            }
+
+            var response = executeSwitch(primaryAuth)
+            var body = response.body.string()
+
+            if (!response.isSuccessful && body.contains("client_id")) {
+                response = executeSwitch(fallbackAuth)
+                body = response.body.string()
+            }
+
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Switch profile failed (HTTP ${response.code}): $body")
+            }
+
+            val tokenResponse = json.decodeFromString<TokenResponse>(body)
+            val expiresAt = System.currentTimeMillis() + ((tokenResponse.expires_in - 60) * 1000)
+
+            val cachedProfiles = getCachedProfiles()
+            val targetProfile = cachedProfiles.find { it.profileId == profileId }
+            val targetName = targetProfile?.profileName ?: "Profile"
+
+            val editor = preferences.edit()
+                .putString(KEY_ACCESS_TOKEN, tokenResponse.access_token)
+                .putLong(KEY_TOKEN_EXPIRY, expiresAt)
+                .putBoolean(KEY_IS_GUEST, false)
+                .putString(KEY_PROFILE_ID, profileId)
+                .putString(KEY_PROFILE_NAME, targetName)
+
+            if (!tokenResponse.refresh_token.isNullOrBlank()) {
+                editor.putString(KEY_REFRESH_TOKEN, tokenResponse.refresh_token)
+            }
+            val newAccountId = tokenResponse.account_id
+                ?: extractJwtClaim(tokenResponse.access_token, "account_id")
+                ?: extractJwtClaim(tokenResponse.access_token, "sub")
+            if (!newAccountId.isNullOrBlank()) {
+                editor.putString(KEY_ACCOUNT_ID, newAccountId)
+            }
+
+            if (cachedProfiles.isNotEmpty()) {
+                val updatedProfiles = cachedProfiles.map {
+                    it.copy(isSelected = it.profileId == profileId)
+                }
+                val updatedJson = json.encodeToString(AllProfilesResponse(profiles = updatedProfiles))
+                editor.putString(KEY_PROFILES_JSON, updatedJson)
+            }
+
+            editor.apply()
+
+            targetProfile?.copy(isSelected = true)
+                ?: CrProfile(profileId = profileId, profileName = targetName, isSelected = true)
+        }
+    }
+
+    private fun extractJwtClaim(jwt: String, claimKey: String): String? {
+        return runCatching {
+            val parts = jwt.split(".")
+            if (parts.size >= 2) {
+                val payloadBytes = android.util.Base64.decode(
+                    parts[1],
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
+                )
+                val jsonStr = String(payloadBytes, StandardCharsets.UTF_8)
+                val obj = json.parseToJsonElement(jsonStr).jsonObject
+                obj[claimKey]?.jsonPrimitive?.contentOrNull
+            } else null
+        }.getOrNull()
+    }
+
+    private fun requestProfilePassToken(accountId: String, profileId: String, pin: String): String {
+        val jsonBody = """{"credential_type":"profile_pin","profile_id":"$profileId","value":"$pin"}"""
+        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
+        val isWebViewSession = !getRefreshTokenFromWebView().isNullOrBlank()
+        val authHeader = if (isWebViewSession) WEB_BASIC_AUTH_HEADER else ANDROID_BASIC_AUTH_HEADER
+        val userAgent = if (isWebViewSession) WEB_USER_AGENT else USER_AGENT
+        val request = Request.Builder()
+            .url("https://beta-api.crunchyroll.com/auth/v1/$accountId/passtoken")
+            .headers(
+                Headers.headersOf(
+                    "User-Agent", userAgent,
+                    "Authorization", authHeader,
+                    "Content-Type", "application/json",
+                ),
+            )
+            .post(jsonBody.toRequestBody(mediaType))
+            .build()
+
+        val response = authClient.newCall(request).execute()
+        val body = response.body.string()
+        if (!response.isSuccessful) {
+            throw IllegalStateException("PIN verification failed (HTTP ${response.code})")
+        }
+        return json.decodeFromString<PassTokenResponse>(body).passToken
+    }
+
     fun isUserLoggedIn(): Boolean {
         val webViewRt = getRefreshTokenFromWebView()
         val email = preferences.getString(PREF_EMAIL, null)
@@ -286,6 +540,9 @@ class MiruRollAuth(
             .remove(KEY_ACCOUNT_ID)
             .remove(KEY_IS_GUEST)
             .remove(KEY_LAST_WEBVIEW_RT)
+            .remove(KEY_PROFILE_ID)
+            .remove(KEY_PROFILE_NAME)
+            .remove(KEY_PROFILES_JSON)
             .apply()
     }
 
@@ -308,9 +565,14 @@ class MiruRollAuth(
         private const val KEY_DEVICE_ID = "cr_device_id"
         private const val KEY_IS_GUEST = "cr_is_guest"
         private const val KEY_LAST_WEBVIEW_RT = "cr_last_webview_rt"
+        const val KEY_PROFILE_ID = "cr_profile_id"
+        const val KEY_PROFILE_NAME = "cr_profile_name"
+        const val KEY_PROFILES_JSON = "cr_profiles_json"
 
         const val PREF_EMAIL = "cr_pref_email"
         const val PREF_PASSWORD = "cr_pref_password"
         const val PREF_CUSTOM_REFRESH_TOKEN = "cr_pref_custom_refresh_token"
+        const val PREF_ACTIVE_PROFILE = "cr_pref_active_profile"
+        const val PREF_PROFILE_PIN = "cr_pref_profile_pin"
     }
 }

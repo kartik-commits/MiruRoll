@@ -12,6 +12,42 @@ data class TokenResponse(
     val scope: String? = null,
     val country: String? = null,
     val account_id: String? = null,
+    val profile_id: String? = null,
+)
+
+@Serializable
+data class AllProfilesResponse(
+    @SerialName("max_profiles")
+    val maxProfiles: Int? = null,
+    val profiles: List<CrProfile> = emptyList(),
+)
+
+@Serializable
+data class CrProfile(
+    @SerialName("profile_id")
+    val profileId: String,
+    @SerialName("profile_name")
+    val profileName: String = "",
+    val avatar: String? = null,
+    val username: String? = null,
+    @SerialName("is_primary")
+    val isPrimary: Boolean = false,
+    @SerialName("is_selected")
+    val isSelected: Boolean = false,
+    @SerialName("can_switch")
+    val canSwitch: Boolean = true,
+    @SerialName("is_pin_protected")
+    val isPinProtected: Boolean = false,
+    @SerialName("preferred_content_audio_language")
+    val preferredAudioLanguage: String? = null,
+    @SerialName("preferred_content_subtitle_language")
+    val preferredSubtitleLanguage: String? = null,
+)
+
+@Serializable
+data class PassTokenResponse(
+    @SerialName("pass_token")
+    val passToken: String,
 )
 
 @Serializable

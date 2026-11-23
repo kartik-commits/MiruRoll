@@ -3,7 +3,10 @@ package dev.kartiks.animiru.miruroll
 import android.app.Application
 import android.content.SharedPreferences
 import android.util.Log
+import android.widget.Toast
 import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -26,8 +29,10 @@ import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -327,10 +332,19 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private suspend fun getPlayback(epData: MiruEpisodeData): Pair<String, PlaybackV4Response> {
         val isSpecificDub = !epData.versionGuid.isNullOrBlank()
+        val preferredAudio = auth.getActiveProfilePreferredAudioLanguage()
         val targetVersion = if (isSpecificDub) {
             epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
         } else {
-            epData.availableVersions.firstOrNull { it.original } ?: epData.availableVersions.firstOrNull()
+            val preferredMatch = if (!preferredAudio.isNullOrBlank()) {
+                epData.availableVersions.firstOrNull {
+                    it.audio_locale.equals(preferredAudio, ignoreCase = true)
+                }
+            } else null
+
+            preferredMatch
+                ?: epData.availableVersions.firstOrNull { it.original }
+                ?: epData.availableVersions.firstOrNull()
         }
 
         val candidateIds = if (isSpecificDub) {
@@ -361,7 +375,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                 (failedTargets[targetId] ?: 0L) <= now
             }
             if (activeCandidates.isEmpty() && candidateIds.isNotEmpty()) {
-                throw IllegalStateException("Audio dub is temporarily throttled or region-locked")
+                val profileName = auth.getActiveProfileName()
+                throw IllegalStateException("Playback unavailable for profile '$profileName' (content may be restricted by maturity rating or region)")
             }
 
             var fatalThrottled = false
@@ -547,22 +562,150 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
+        val scope = CoroutineScope(Dispatchers.IO)
 
-        androidx.preference.Preference().apply {
-            key = "pref_account_status"
-            title = "Account Status"
-            summary = if (auth.isUserLoggedIn()) {
+        fun getAccountSummary(): String {
+            return if (auth.isUserLoggedIn()) {
+                val activeProfile = auth.getActiveProfileName()
                 val webViewRt = auth.getRefreshTokenFromWebView()
                 val email = preferences.getString(MiruRollAuth.PREF_EMAIL, null)
-                when {
-                    !webViewRt.isNullOrBlank() -> "Logged in via WebView (Active Session Cookie detected)"
-                    !email.isNullOrBlank() -> "Logged in as: $email"
-                    else -> "Logged in via Refresh Token"
+                val method = when {
+                    !webViewRt.isNullOrBlank() -> "WebView Session"
+                    !email.isNullOrBlank() -> email
+                    else -> "Refresh Token"
                 }
+                "Logged in ($method) • Profile: $activeProfile"
             } else {
                 "Guest Mode. Tap the 🌐 Globe icon on top right to Log In via WebView!"
             }
-        }.also(screen::addPreference)
+        }
+
+        val accountPref = Preference().apply {
+            key = "pref_account_status"
+            title = "Account Status"
+            summary = getAccountSummary()
+        }
+        screen.addPreference(accountPref)
+
+        if (auth.isUserLoggedIn()) {
+            val cachedProfiles = auth.getCachedProfiles()
+            val activeId = auth.getActiveProfileId()
+            val activeName = auth.getActiveProfileName()
+
+            val profilePref = ListPreference(context).apply {
+                key = MiruRollAuth.PREF_ACTIVE_PROFILE
+                title = "Active Profile"
+                summary = "Current: $activeName"
+
+                if (cachedProfiles.isNotEmpty()) {
+                    entries = cachedProfiles.map { p ->
+                        if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
+                    }.toTypedArray()
+                    entryValues = cachedProfiles.map { it.profileId }.toTypedArray()
+                    value = activeId ?: cachedProfiles.firstOrNull()?.profileId
+                } else {
+                    entries = arrayOf(activeName)
+                    entryValues = arrayOf(activeId ?: "")
+                    value = activeId
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val newProfileId = newValue as String
+                    val pin = preferences.getString(MiruRollAuth.PREF_PROFILE_PIN, null)?.trim()
+                    scope.launch {
+                        val result = auth.switchProfile(newProfileId, pin)
+                        withContext(Dispatchers.Main) {
+                            result.onSuccess { switched ->
+                                summary = "Current: ${switched.profileName}"
+                                value = switched.profileId
+                                accountPref.summary = getAccountSummary()
+                                playbackCache.clear()
+                                resolutionCache.clear()
+                                failedTargets.clear()
+                                Toast.makeText(context, "Switched profile to ${switched.profileName}", Toast.LENGTH_SHORT).show()
+                            }.onFailure { err ->
+                                Toast.makeText(context, "Failed to switch profile: ${err.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                    true
+                }
+            }
+            screen.addPreference(profilePref)
+
+            EditTextPreference(context).apply {
+                key = MiruRollAuth.PREF_PROFILE_PIN
+                title = "Profile PIN (Optional)"
+                summary = if (preferences.getString(MiruRollAuth.PREF_PROFILE_PIN, null).isNullOrBlank()) {
+                    "Not set (only needed for PIN-protected profiles)"
+                } else {
+                    "••••"
+                }
+                dialogTitle = "Enter Profile PIN"
+                setOnPreferenceChangeListener { _, newValue ->
+                    val newPin = (newValue as? String)?.trim()
+                    summary = if (newPin.isNullOrBlank()) {
+                        "Not set (only needed for PIN-protected profiles)"
+                    } else {
+                        "••••"
+                    }
+                    true
+                }
+            }.also(screen::addPreference)
+
+            Preference().apply {
+                key = "pref_refresh_profiles"
+                title = "Refresh Profiles"
+                summary = "Reload profile list from Crunchyroll"
+                setOnPreferenceClickListener {
+                    summary = "Refreshing profiles..."
+                    scope.launch {
+                        runCatching {
+                            auth.fetchProfiles()
+                        }.onSuccess { profiles ->
+                            withContext(Dispatchers.Main) {
+                                profilePref.entries = profiles.map { p ->
+                                    if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
+                                }.toTypedArray()
+                                profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
+                                val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
+                                if (active != null) {
+                                    profilePref.value = active.profileId
+                                    profilePref.summary = "Current: ${active.profileName}"
+                                }
+                                summary = "Reload profile list from Crunchyroll"
+                                accountPref.summary = getAccountSummary()
+                                Toast.makeText(context, "Profiles refreshed (${profiles.size} found)", Toast.LENGTH_SHORT).show()
+                            }
+                        }.onFailure { err ->
+                            withContext(Dispatchers.Main) {
+                                summary = "Failed to refresh profiles"
+                                Toast.makeText(context, "Error: ${err.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                    true
+                }
+            }.also(screen::addPreference)
+
+            // Auto-refresh profiles in the background when settings screen opens
+            scope.launch {
+                runCatching { auth.fetchProfiles() }.onSuccess { profiles ->
+                    withContext(Dispatchers.Main) {
+                        profilePref.entries = profiles.map { p ->
+                            if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
+                        }.toTypedArray()
+                        profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
+                        val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
+                        if (active != null) {
+                            profilePref.value = active.profileId
+                            profilePref.summary = "Current: ${active.profileName}"
+                            accountPref.summary = getAccountSummary()
+                        }
+                    }
+                }
+            }
+        }
 
         EditTextPreference(context).apply {
             key = MiruRollAuth.PREF_EMAIL
