@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Animiru (Widevine Edition)
+    url: https://github.com/kartik-commits/Animiru-fork
+    about: App-level issues, player core, and DRM playback questions
+  - name: Miru Extension Repository
+    url: https://github.com/kartik-commits/miru-extension
+    about: Extension distribution repository and 1-tap installation

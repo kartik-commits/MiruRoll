@@ -1,0 +1,33 @@
+name: Feature Request
+description: Suggest an enhancement or new feature for MiruRoll
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature Description
+      description: A clear and concise description of the proposed feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What problem or limitation does this feature address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Additional Context / Alternatives
+      description: Any alternatives considered, UI ideas, or additional context.
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I have checked existing issues and feature requests to avoid duplicates.
+          required: true
