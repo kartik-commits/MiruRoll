@@ -14,13 +14,30 @@ MiruRoll is an open-source Crunchyroll extension built for [**Animiru (Media3 Wi
 MiruRoll is strictly **not** a piracy tool or unauthorized scraper. It communicates directly with official Crunchyroll APIs and decrypts protected streams using Android's native Widevine DRM CDM and official OAuth authentication. All content security and licensing boundaries are fully preserved.
 
 ### Merits for Crunchyroll
-By providing a legal, authenticated client for open-source media aggregators, MiruRoll gives j*bless anime fans and tech-savvy users a reason to maintain active Crunchyroll subscriptions instead of resorting to illicit third-party sites.
+By providing a legal, authenticated client for open-source media aggregators, MiruRoll gives fans and power users a reason to maintain active Crunchyroll subscriptions instead of resorting to third-party sites.
 
-### Key Advantages over the Official Client
-- **Seamless Tracking:** Automatic progress syncing with AniList, MyAnimeList, Kitsu, and Shikimori.
-- **Deep Player Customization:** Granular control over subtitle fonts, colors, outlines, scaling, bottom padding, and ASS(LoL) overrides.
-- **Unified Seasons Hierarchy:** Groups anime into clean Parent Series → Seasons → Episodes instead of fragmented duplicate dub/sub listings.
-- **Advanced Playback Controls:** Native Picture-in-Picture (PiP), AniSkip intro/outro skipping, and custom hardware gesture mapping.
+---
+
+## Features
+
+- **Direct Crunchyroll streams**: Play original, full-quality video streams directly from Crunchyroll servers.
+- **Unified series**: All seasons, OVAs and movies grouped under one show instead of cluttering search with duplicate dub entries.
+- **In-player audio switching**: Swap between Japanese audio and your preferred dubs (English, Hindi, etc.) on the fly without reloading.
+- **Two-way watch history**: Start on your TV or browser and pick up where you left off in Animiru and vice versa. Marking episodes watched or unwatched stays in sync.
+- **Profile switching & PIN support**: Switch between family/personal profiles, with support for 4-digit PIN-protected profiles.
+- **Flexible sign-in**: In-app browser login with CAPTCHA and 2FA support, plus standard email/password or guest browsing.
+- **Custom subtitles**: Full control over subtitle fonts, sizing, colors and positioning.
+- **Tracker integration**: Automatic progress syncing with AniList, MyAnimeList, Kitsu and others.
+
+---
+
+## Roadmap
+
+- [ ] **Watchlist sync**: Browse and manage your Crunchyroll queue directly from your library.
+- [ ] **Continue Watching shelf**: A dedicated row to quickly resume in-progress shows.
+- [ ] **Dub & season filters**: Filter catalog searches by audio language (e.g. Hindi dubs) or release season.
+- [ ] **Skip intro/outro**: One-tap buttons to skip openings and endings.
+- [ ] ...plus many more features to come.
 
 ---
 
@@ -61,7 +78,7 @@ MiruRoll functions in **Guest Mode** by default with no account required for fre
 #### Method 1: WebView Login (Recommended)
 1. In Animiru, open the **MiruRoll** source.
 2. Tap the WebView icon in the top app bar to open the built-in browser.
-3. Sign in to your Crunchyroll account (this method natively supports Google, Apple, and 2FA SSO sign-ins).
+3. Sign in to your Crunchyroll account (this method easily handles Cloudflare verification and 2FA security codes).
 4. Return to Animiru once signed in. MiruRoll automatically captures your session cookie and keeps you authenticated.
 
 #### Method 2: Email & Password Direct Login
@@ -70,7 +87,7 @@ MiruRoll functions in **Guest Mode** by default with no account required for fre
 3. Enter your **MiruRoll Password**.
 4. The extension will authenticate via official OAuth and acquire subscriber access tokens.
 
-*(Optional)*: If your account uses third-party SSO or 2FA and you prefer manual token entry, you can paste your Crunchyroll `refresh_token` into the **Custom Refresh Token** field in settings.
+*(Optional)*: If your account uses 2FA and you prefer manual token entry, you can paste your Crunchyroll `refresh_token` into the **Custom Refresh Token** field in settings.
 
 ---
 
