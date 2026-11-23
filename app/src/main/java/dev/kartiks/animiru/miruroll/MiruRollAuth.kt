@@ -141,6 +141,20 @@ class MiruRollAuth(
             }
         }
 
+        return obtainBaseAccessToken()
+    }
+
+    private fun obtainBaseAccessToken(): String {
+        val webViewRefreshToken = getRefreshTokenFromWebView()
+        val customRefreshToken = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)?.trim()
+        val storedRefreshToken = preferences.getString(KEY_REFRESH_TOKEN, null)?.trim()
+        val isCachedGuest = preferences.getBoolean(KEY_IS_GUEST, false)
+        val userEmail = preferences.getString(PREF_EMAIL, null)?.trim()
+        val userPass = preferences.getString(PREF_PASSWORD, null)
+        val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
+            preferences.edit().putString(KEY_DEVICE_ID, it).apply()
+        }
+
         var isGuest = false
         val finalResponse = when {
             !webViewRefreshToken.isNullOrBlank() -> {
@@ -209,6 +223,15 @@ class MiruRollAuth(
         editor.apply()
 
         return finalResponse.access_token
+    }
+
+    private fun getValidAccessToken(): String {
+        val currentToken = preferences.getString(KEY_ACCESS_TOKEN, null)
+        val expiryTime = preferences.getLong(KEY_TOKEN_EXPIRY, 0L)
+        if (!currentToken.isNullOrBlank() && System.currentTimeMillis() < expiryTime) {
+            return currentToken
+        }
+        return obtainBaseAccessToken()
     }
 
     private fun requestWebCookieToken(etpRt: String, deviceId: String): TokenResponse {
@@ -383,20 +406,30 @@ class MiruRollAuth(
                 preferences.edit().putString(KEY_DEVICE_ID, it).apply()
             }
 
+            val effectivePin = pin?.trim()?.ifBlank { null }
+                ?: preferences.getString(PREF_PROFILE_PIN, null)?.trim()?.ifBlank { null }
+
+            var cachedProfiles = getCachedProfiles()
+            if (cachedProfiles.isEmpty()) {
+                cachedProfiles = runCatching { fetchProfiles() }.getOrDefault(emptyList())
+            }
+            val targetProfile = cachedProfiles.find { it.profileId == profileId }
+            val isPinProtected = targetProfile?.isPinProtected == true
+
+            if (isPinProtected && effectivePin.isNullOrBlank()) {
+                throw IllegalStateException("Profile '${targetProfile?.profileName ?: profileId}' is PIN-protected. Please set your PIN in 'Profile PIN (Optional)' setting first.")
+            }
+
             var passToken: String? = null
             var accountId = preferences.getString(KEY_ACCOUNT_ID, null)
-            if (!pin.isNullOrBlank()) {
+            if (isPinProtected && !effectivePin.isNullOrBlank()) {
+                val currentToken = getValidAccessToken()
                 if (accountId.isNullOrBlank()) {
-                    val currentToken = preferences.getString(KEY_ACCESS_TOKEN, null)
-                    if (currentToken != null) {
-                        accountId = extractJwtClaim(currentToken, "account_id")
-                            ?: extractJwtClaim(currentToken, "sub")
-                    }
+                    accountId = extractJwtClaim(currentToken, "account_id")
+                        ?: extractJwtClaim(currentToken, "sub")
                 }
                 if (!accountId.isNullOrBlank()) {
-                    runCatching {
-                        passToken = requestProfilePassToken(accountId, profileId, pin)
-                    }
+                    passToken = requestProfilePassToken(currentToken, accountId, profileId, effectivePin)
                 }
             }
 
@@ -441,14 +474,15 @@ class MiruRollAuth(
             }
 
             if (!response.isSuccessful) {
+                if (body.contains("invalid_credentials") || body.contains("invalid_grant")) {
+                    throw IllegalStateException("Switch profile failed: Profile may require a PIN or session expired. (HTTP ${response.code})")
+                }
                 throw IllegalStateException("Switch profile failed (HTTP ${response.code}): $body")
             }
 
             val tokenResponse = json.decodeFromString<TokenResponse>(body)
             val expiresAt = System.currentTimeMillis() + ((tokenResponse.expires_in - 60) * 1000)
 
-            val cachedProfiles = getCachedProfiles()
-            val targetProfile = cachedProfiles.find { it.profileId == profileId }
             val targetName = targetProfile?.profileName ?: "Profile"
 
             val editor = preferences.edit()
@@ -457,6 +491,7 @@ class MiruRollAuth(
                 .putBoolean(KEY_IS_GUEST, false)
                 .putString(KEY_PROFILE_ID, profileId)
                 .putString(KEY_PROFILE_NAME, targetName)
+                .putString(PREF_ACTIVE_PROFILE, profileId)
 
             if (!tokenResponse.refresh_token.isNullOrBlank()) {
                 editor.putString(KEY_REFRESH_TOKEN, tokenResponse.refresh_token)
@@ -498,18 +533,15 @@ class MiruRollAuth(
         }.getOrNull()
     }
 
-    private fun requestProfilePassToken(accountId: String, profileId: String, pin: String): String {
+    private fun requestProfilePassToken(accessToken: String, accountId: String, profileId: String, pin: String): String {
         val jsonBody = """{"credential_type":"profile_pin","profile_id":"$profileId","value":"$pin"}"""
         val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
-        val isWebViewSession = !getRefreshTokenFromWebView().isNullOrBlank()
-        val authHeader = if (isWebViewSession) WEB_BASIC_AUTH_HEADER else ANDROID_BASIC_AUTH_HEADER
-        val userAgent = if (isWebViewSession) WEB_USER_AGENT else USER_AGENT
         val request = Request.Builder()
             .url("https://beta-api.crunchyroll.com/auth/v1/$accountId/passtoken")
             .headers(
                 Headers.headersOf(
-                    "User-Agent", userAgent,
-                    "Authorization", authHeader,
+                    "User-Agent", USER_AGENT,
+                    "Authorization", "Bearer $accessToken",
                     "Content-Type", "application/json",
                 ),
             )
@@ -519,9 +551,16 @@ class MiruRollAuth(
         val response = authClient.newCall(request).execute()
         val body = response.body.string()
         if (!response.isSuccessful) {
-            throw IllegalStateException("PIN verification failed (HTTP ${response.code})")
+            if (body.contains("failed_pass_token_credentials") || body.contains("invalid_credential")) {
+                throw IllegalStateException("Incorrect Profile PIN entered")
+            }
+            throw IllegalStateException("PIN verification failed (HTTP ${response.code}): $body")
         }
-        return json.decodeFromString<PassTokenResponse>(body).passToken
+        val token = json.decodeFromString<PassTokenResponse>(body).effectiveToken
+        if (token.isBlank()) {
+            throw IllegalStateException("PIN verification returned empty pass token")
+        }
+        return token
     }
 
     fun isUserLoggedIn(): Boolean {

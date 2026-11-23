@@ -592,15 +592,19 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             val activeId = auth.getActiveProfileId()
             val activeName = auth.getActiveProfileName()
 
+            fun formatProfileLabel(p: CrProfile): String {
+                val lock = if (p.isPinProtected) " 🔒" else ""
+                val primary = if (p.isPrimary) " (Primary)" else ""
+                return "${p.profileName}$primary$lock"
+            }
+
             val profilePref = ListPreference(context).apply {
                 key = MiruRollAuth.PREF_ACTIVE_PROFILE
                 title = "Active Profile"
                 summary = "Current: $activeName"
 
                 if (cachedProfiles.isNotEmpty()) {
-                    entries = cachedProfiles.map { p ->
-                        if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
-                    }.toTypedArray()
+                    entries = cachedProfiles.map { formatProfileLabel(it) }.toTypedArray()
                     entryValues = cachedProfiles.map { it.profileId }.toTypedArray()
                     value = activeId ?: cachedProfiles.firstOrNull()?.profileId
                 } else {
@@ -644,6 +648,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                 dialogTitle = "Enter Profile PIN"
                 setOnPreferenceChangeListener { _, newValue ->
                     val newPin = (newValue as? String)?.trim()
+                    preferences.edit().putString(MiruRollAuth.PREF_PROFILE_PIN, newPin).apply()
                     summary = if (newPin.isNullOrBlank()) {
                         "Not set (only needed for PIN-protected profiles)"
                     } else {
@@ -664,9 +669,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                             auth.fetchProfiles()
                         }.onSuccess { profiles ->
                             withContext(Dispatchers.Main) {
-                                profilePref.entries = profiles.map { p ->
-                                    if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
-                                }.toTypedArray()
+                                profilePref.entries = profiles.map { formatProfileLabel(it) }.toTypedArray()
                                 profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
                                 val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
                                 if (active != null) {
@@ -692,9 +695,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             scope.launch {
                 runCatching { auth.fetchProfiles() }.onSuccess { profiles ->
                     withContext(Dispatchers.Main) {
-                        profilePref.entries = profiles.map { p ->
-                            if (p.isPrimary) "${p.profileName} (Primary)" else p.profileName
-                        }.toTypedArray()
+                        profilePref.entries = profiles.map { formatProfileLabel(it) }.toTypedArray()
                         profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
                         val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
                         if (active != null) {

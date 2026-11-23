@@ -46,9 +46,12 @@ data class CrProfile(
 
 @Serializable
 data class PassTokenResponse(
+    val code: String = "",
     @SerialName("pass_token")
-    val passToken: String,
-)
+    val passToken: String = "",
+) {
+    val effectiveToken: String get() = code.ifBlank { passToken }
+}
 
 @Serializable
 data class BrowseResponse(
