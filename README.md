@@ -41,30 +41,35 @@ By providing a legal, authenticated client for open-source media aggregators, Mi
 
 ---
 
-## Build & Installation
+## Installation
 
-### Prerequisites
-- Android SDK (API 26+)
-- JDK 17 or higher
+### Easy Install (Recommended)
 
-### 1. Build Extension APK
-Clone the repository and compile using Gradle:
+1. Open **Animiru**.
+2. Navigate to **More → Settings → Browse → Extension Repositories**.
+3. Tap **Add repository** and paste:
 
-```bash
-./gradlew :app:assembleRelease
+```text
+https://raw.githubusercontent.com/kartik-commits/miru-extension/main/index.min.json
 ```
-Output: `app/build/outputs/apk/release/app-release.apk`
 
-### 2. Install on Device
-With an Android device or emulator connected via ADB:
+4. Go to **Browse → Extensions** and tap **Install** next to MiruRoll.
+
+---
+
+### Manual Build from Source
+
+If you prefer building the extension yourself:
+
 ```bash
+# Build the release APK
+./gradlew assembleRelease
+
+# Install on your device via ADB
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-### 3. Activating in Animiru
-1. Open Animiru and go to **Browse → Extensions**.
-2. Locate **MiruRoll** (marked as *Untrusted* upon first manual installation).
-3. Tap **Trust** in the dialog to grant loading permission and activate the extension.
+Once installed, go to **Browse → Extensions** in Animiru and tap **Trust** when prompted.
 
 ---
 
