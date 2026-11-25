@@ -89,19 +89,20 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         return GET("$baseUrl/content/v2/discover/browse?start=$start&n=$PAGE_SIZE&sort_by=popularity&locale=en-US")
     }
 
+    private fun BrowseItem.toSAnime(): SAnime = SAnime.create().apply {
+        val isMovie = type == "movie_listing"
+        url = if (isMovie) "/movie_listing/$id" else "/series/$id"
+        title = this@toSAnime.title
+        description = this@toSAnime.description
+        thumbnail_url = images?.posterTall?.firstOrNull()?.lastOrNull()?.source
+        fetch_type = if (isMovie) FetchType.Episodes else FetchType.Seasons
+        initialized = true
+    }
+
     override fun popularAnimeParse(response: Response): AnimesPage {
         val body = response.body.string()
         val parsed = json.decodeFromString<BrowseResponse>(body)
-        val animeList = parsed.data.map { item ->
-            SAnime.create().apply {
-                url = "/series/${item.id}"
-                title = item.title
-                description = item.description
-                thumbnail_url = item.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
-                fetch_type = FetchType.Seasons
-                initialized = true
-            }
-        }
+        val animeList = parsed.data.map { it.toSAnime() }
         val start = response.request.url.queryParameter("start")?.toIntOrNull() ?: 0
         return AnimesPage(animeList, start + PAGE_SIZE < parsed.total)
     }
@@ -134,16 +135,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             val parsed = json.decodeFromString<SearchResponse>(body)
             val seriesSection = parsed.data.firstOrNull { it.type == "series" || it.type == "top_results" }
             val items = seriesSection?.items ?: parsed.data.flatMap { it.items }
-            val animeList = items.distinctBy { it.id }.map { item ->
-                SAnime.create().apply {
-                    url = "/series/${item.id}"
-                    title = item.title
-                    description = item.description
-                    thumbnail_url = item.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
-                    fetch_type = FetchType.Seasons
-                    initialized = true
-                }
-            }
+            val animeList = items.distinctBy { it.id }.map { it.toSAnime() }
             AnimesPage(animeList, false)
         } else {
             popularAnimeParse(response)
@@ -207,6 +199,48 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         return SAnimeSeasonUpdate(updatedParent, childSeasons)
     }
 
+    private fun fetchPlayheadsForCandidates(allCandidateIds: List<String>): Map<String, CrPlayhead> {
+        if (allCandidateIds.isEmpty()) return emptyMap()
+        val shouldSyncHistory = preferences.getBoolean("cr_pref_sync_history", true) && auth.isUserLoggedIn()
+        return if (shouldSyncHistory) auth.getPlayheads(allCandidateIds) else emptyMap()
+    }
+
+    private fun buildPlayableEpisode(
+        id: String,
+        audioLocale: String,
+        streamsLink: String?,
+        versions: List<EpisodeVersion>,
+        episodeNumber: Float,
+        episodeName: String,
+        playheads: Map<String, CrPlayhead>,
+    ): SEpisode {
+        val origVersion = versions.firstOrNull { it.original } ?: versions.firstOrNull()
+        val epData = MiruEpisodeData(
+            episodeId = id,
+            audioLocale = origVersion?.audio_locale ?: audioLocale,
+            versionGuid = origVersion?.guid,
+            mediaGuid = origVersion?.mediaGuid,
+            streamsLink = streamsLink,
+            availableVersions = versions,
+        )
+        val epCandidates = (listOf(id) + versions.map { it.guid }).distinct()
+        val matchingPlayheads = epCandidates.mapNotNull { playheads[it] }
+        val crPlayhead = matchingPlayheads.firstOrNull { it.fullyWatched }
+            ?: matchingPlayheads.maxByOrNull { it.playhead }
+        return SEpisode.create().apply {
+            url = json.encodeToString(epData)
+            name = episodeName
+            episode_number = episodeNumber
+            scanlator = "Audio: $audioLocale"
+            if (crPlayhead != null) {
+                memo = buildJsonObject {
+                    put("cr_playhead", JsonPrimitive(crPlayhead.playhead))
+                    put("cr_fully_watched", JsonPrimitive(crPlayhead.fullyWatched))
+                }
+            }
+        }
+    }
+
     override suspend fun getAnimeEpisodeUpdate(
         anime: SAnime,
         episodes: List<SEpisode>,
@@ -214,7 +248,24 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         fetchEpisodes: Boolean,
     ): SAnimeEpisodeUpdate {
         val updated = anime.apply {
-            if (fetchDetails) {
+            if (fetchDetails && url.startsWith("/movie_listing/")) {
+                val listingId = url.removePrefix("/movie_listing/")
+                runCatching {
+                    client.newCall(GET("$baseUrl/content/v2/cms/movie_listings/$listingId?locale=en-US"))
+                        .execute()
+                        .use { resp ->
+                            if (!resp.isSuccessful) return@use
+                            val details = json.decodeFromString<BrowseResponse>(resp.body.string())
+                            details.data.firstOrNull()?.let { info ->
+                                title = info.title
+                                description = info.description
+                                thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
+                                status = SAnime.COMPLETED
+                            }
+                        }
+                }
+                initialized = true
+            } else if (fetchDetails) {
                 initialized = true
             }
         }
@@ -234,43 +285,54 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             val allCandidateIds = parsedEpisodes.data.flatMap { ep ->
                 listOf(ep.id) + (ep.versions?.map { it.guid } ?: emptyList())
             }.distinct()
-
-            val shouldSyncHistory = preferences.getBoolean("cr_pref_sync_history", true) && auth.isUserLoggedIn()
-            val playheads = if (shouldSyncHistory) {
-                auth.getPlayheads(allCandidateIds)
-            } else {
-                emptyMap()
-            }
+            val playheads = fetchPlayheadsForCandidates(allCandidateIds)
 
             parsedEpisodes.data.sortedBy { it.sequenceNumber }.map { ep ->
                 val versions = ep.versions ?: emptyList()
-                val origVersion = versions.firstOrNull { it.original } ?: versions.firstOrNull()
-                val versionGuid = origVersion?.guid
-                val mediaGuid = origVersion?.mediaGuid
-                val epData = MiruEpisodeData(
-                    episodeId = ep.id,
-                    audioLocale = origVersion?.audio_locale ?: ep.audioLocale,
-                    versionGuid = versionGuid,
-                    mediaGuid = mediaGuid,
+                buildPlayableEpisode(
+                    id = ep.id,
+                    audioLocale = ep.audioLocale,
                     streamsLink = ep.streams_link,
-                    availableVersions = versions,
+                    versions = versions,
+                    episodeNumber = ep.episodeNumber,
+                    episodeName = if (ep.episodeNumber > 0) "E${ep.episodeNumber.toInt()} - ${ep.title}" else ep.title,
+                    playheads = playheads,
                 )
-                val epCandidates = (listOf(ep.id) + versions.map { it.guid }).distinct()
-                val matchingPlayheads = epCandidates.mapNotNull { playheads[it] }
-                val crPlayhead = matchingPlayheads.firstOrNull { it.fullyWatched }
-                    ?: matchingPlayheads.maxByOrNull { it.playhead }
-                SEpisode.create().apply {
-                    url = json.encodeToString(epData)
-                    name = if (ep.episodeNumber > 0) "E${ep.episodeNumber.toInt()} - ${ep.title}" else ep.title
-                    episode_number = ep.episodeNumber
-                    scanlator = "Audio: ${ep.audioLocale}"
-                    if (crPlayhead != null) {
-                        memo = buildJsonObject {
-                            put("cr_playhead", JsonPrimitive(crPlayhead.playhead))
-                            put("cr_fully_watched", JsonPrimitive(crPlayhead.fullyWatched))
-                        }
+            }
+        } else if (fetchEpisodes && anime.url.startsWith("/movie_listing/")) {
+            val listingId = anime.url.removePrefix("/movie_listing/")
+            val body = client.newCall(GET("$baseUrl/content/v2/cms/movie_listings/$listingId/movies?locale=en-US"))
+                .execute()
+                .use { resp ->
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException("Failed to fetch movies (HTTP ${resp.code})")
                     }
+                    resp.body.string()
                 }
+            val parsedMovies = json.decodeFromString<MoviesResponse>(body)
+
+            val allCandidateIds = parsedMovies.data.flatMap { movie ->
+                listOf(movie.id) + (movie.versions?.map { it.guid } ?: emptyList())
+            }.distinct()
+            val playheads = fetchPlayheadsForCandidates(allCandidateIds)
+
+            parsedMovies.data.mapIndexed { index, movie ->
+                val versions = movie.versions ?: emptyList()
+                val movieNumber = (index + 1).toFloat()
+                val displayName = if (parsedMovies.data.size > 1) {
+                    "Movie ${index + 1} - ${movie.title}"
+                } else {
+                    movie.title.ifBlank { "Movie" }
+                }
+                buildPlayableEpisode(
+                    id = movie.id,
+                    audioLocale = movie.audioLocale,
+                    streamsLink = movie.streams_link,
+                    versions = versions,
+                    episodeNumber = movieNumber,
+                    episodeName = displayName,
+                    playheads = playheads,
+                )
             }
         } else {
             episodes

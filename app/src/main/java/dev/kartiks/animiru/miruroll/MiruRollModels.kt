@@ -81,6 +81,8 @@ data class BrowseItem(
     val images: BrowseImages? = null,
     @SerialName("series_metadata")
     val seriesMetadata: SeriesMetadata? = null,
+    @SerialName("movie_listing_metadata")
+    val movieListingMetadata: MovieListingMetadata? = null,
 )
 
 @Serializable
@@ -112,6 +114,20 @@ data class SeriesMetadata(
     @SerialName("tenant_categories")
     val categories: List<String> = emptyList(),
     val maturity_ratings: List<String> = emptyList(),
+)
+
+@Serializable
+data class MovieListingMetadata(
+    @SerialName("is_subbed")
+    val isSubbed: Boolean = true,
+    @SerialName("is_dubbed")
+    val isDubbed: Boolean = false,
+    @SerialName("audio_locales")
+    val audioLocales: List<String> = emptyList(),
+    @SerialName("subtitle_locales")
+    val subtitleLocales: List<String> = emptyList(),
+    @SerialName("tenant_categories")
+    val categories: List<String> = emptyList(),
 )
 
 @Serializable
@@ -149,6 +165,35 @@ data class SeasonItem(
 data class EpisodesResponse(
     val total: Int = 0,
     val data: List<EpisodeItem> = emptyList(),
+)
+
+@Serializable
+data class MoviesResponse(
+    val total: Int = 0,
+    val data: List<MovieItem> = emptyList(),
+)
+
+@Serializable
+data class MovieItem(
+    val id: String,
+    @SerialName("listing_id")
+    val listingId: String = "",
+    val title: String = "",
+    val description: String = "",
+    val duration_ms: Long = 0L,
+    @SerialName("is_premium_only")
+    val isPremiumOnly: Boolean = false,
+    @SerialName("is_subbed")
+    val isSubbed: Boolean = true,
+    @SerialName("is_dubbed")
+    val isDubbed: Boolean = false,
+    @SerialName("audio_locale")
+    val audioLocale: String = "ja-JP",
+    @SerialName("available_date")
+    val availableDate: String? = null,
+    val images: BrowseImages? = null,
+    val streams_link: String? = null,
+    val versions: List<EpisodeVersion>? = null,
 )
 
 @Serializable
