@@ -12,7 +12,7 @@ object MiruRollFilters {
         displayName,
         options.map { it.first }.toTypedArray(),
     ) {
-        val selectedValue get() = options[state].second
+        val selectedValue get() = options.getOrElse(state) { options[0] }.second
     }
 
     class SortFilter : SelectFilter("Sort By", SORT_OPTIONS)

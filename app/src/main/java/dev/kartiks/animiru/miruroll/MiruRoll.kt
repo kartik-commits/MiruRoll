@@ -133,10 +133,21 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         val body = response.body.string()
         return if (response.request.url.encodedPath.contains("search")) {
             val parsed = json.decodeFromString<SearchResponse>(body)
-            val seriesSection = parsed.data.firstOrNull { it.type == "series" || it.type == "top_results" }
-            val items = seriesSection?.items ?: parsed.data.flatMap { it.items }
+            val topSection = parsed.data.firstOrNull { it.type == "top_results" }
+            val seriesSection = parsed.data.firstOrNull { it.type == "series" }
+            val movieSection = parsed.data.firstOrNull { it.type == "movie_listing" }
+            val prioritizedItems = buildList {
+                topSection?.items?.filter { it.type == "series" || it.type == "movie_listing" }?.let(::addAll)
+                seriesSection?.items?.let(::addAll)
+                movieSection?.items?.let(::addAll)
+            }
+            val items = prioritizedItems.ifEmpty {
+                parsed.data.flatMap { it.items }.filter { it.type == "series" || it.type == "movie_listing" }
+            }
             val animeList = items.distinctBy { it.id }.map { it.toSAnime() }
-            AnimesPage(animeList, false)
+            val start = response.request.url.queryParameter("start")?.toIntOrNull() ?: 0
+            val maxSectionCount = maxOf(seriesSection?.count ?: 0, movieSection?.count ?: 0)
+            AnimesPage(animeList, start + PAGE_SIZE < maxSectionCount)
         } else {
             popularAnimeParse(response)
         }
