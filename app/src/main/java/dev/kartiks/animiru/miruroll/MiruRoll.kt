@@ -41,6 +41,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.URLEncoder
@@ -282,11 +283,46 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     // ============================ Playback & Widevine DRM =============================
 
+    private data class CachedPlayback(
+        val targetId: String,
+        val response: PlaybackV4Response,
+        val cachedAtMs: Long,
+    )
+
     private val resolutionCache = ConcurrentHashMap<String, List<Int>>()
     private val requestMutex = Mutex()
     private var lastRequestTime = 0L
+    private val cachedAuthEpoch = AtomicLong(-1L)
     private val failedTargets = ConcurrentHashMap<String, Long>()
-    private val playbackCache = ConcurrentHashMap<String, Pair<String, PlaybackV4Response>>()
+    private val playbackCache = ConcurrentHashMap<String, CachedPlayback>()
+
+    private fun invalidateCachesIfAuthChanged() {
+        val currentEpoch = auth.getAuthEpoch()
+        val prevEpoch = cachedAuthEpoch.getAndSet(currentEpoch)
+        if (prevEpoch != -1L && prevEpoch != currentEpoch) {
+            playbackCache.clear()
+            resolutionCache.clear()
+            failedTargets.clear()
+        }
+    }
+
+    private fun resolveTargetVersion(epData: MiruEpisodeData): EpisodeVersion? {
+        val isSpecificDub = !epData.versionGuid.isNullOrBlank()
+        if (isSpecificDub) {
+            return epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
+        }
+        val preferredAudio = auth.getActiveProfilePreferredAudioLanguage()
+        val preferredMatch = if (!preferredAudio.isNullOrBlank()) {
+            epData.availableVersions.firstOrNull {
+                it.audio_locale.equals(preferredAudio, ignoreCase = true)
+            }
+        } else {
+            null
+        }
+        return preferredMatch
+            ?: epData.availableVersions.firstOrNull { it.original }
+            ?: epData.availableVersions.firstOrNull()
+    }
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
         val epData = runCatching {
@@ -375,21 +411,9 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     private suspend fun getPlayback(epData: MiruEpisodeData): Pair<String, PlaybackV4Response> {
+        invalidateCachesIfAuthChanged()
         val isSpecificDub = !epData.versionGuid.isNullOrBlank()
-        val preferredAudio = auth.getActiveProfilePreferredAudioLanguage()
-        val targetVersion = if (isSpecificDub) {
-            epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
-        } else {
-            val preferredMatch = if (!preferredAudio.isNullOrBlank()) {
-                epData.availableVersions.firstOrNull {
-                    it.audio_locale.equals(preferredAudio, ignoreCase = true)
-                }
-            } else null
-
-            preferredMatch
-                ?: epData.availableVersions.firstOrNull { it.original }
-                ?: epData.availableVersions.firstOrNull()
-        }
+        val targetVersion = resolveTargetVersion(epData)
 
         val candidateIds = if (isSpecificDub) {
             listOfNotNull(
@@ -407,14 +431,21 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             ).distinct()
         }
 
+        val now = System.currentTimeMillis()
         var resolvedTargetId = candidateIds.firstOrNull().orEmpty()
-        var parsed: PlaybackV4Response? = candidateIds.firstNotNullOfOrNull { playbackCache[it]?.second }
-        if (parsed != null) {
-            resolvedTargetId = candidateIds.firstOrNull { playbackCache.containsKey(it) } ?: resolvedTargetId
+        var parsed: PlaybackV4Response? = candidateIds.firstNotNullOfOrNull { id ->
+            val entry = playbackCache[id] ?: return@firstNotNullOfOrNull null
+            if (now - entry.cachedAtMs < PLAYBACK_CACHE_TTL_MS) {
+                resolvedTargetId = entry.targetId
+                entry.response
+            } else {
+                playbackCache.remove(id, entry)
+                null
+            }
         }
 
+        var lastHttpFailure = 0
         if (parsed == null) {
-            val now = System.currentTimeMillis()
             val activeCandidates = candidateIds.filter { targetId ->
                 (failedTargets[targetId] ?: 0L) <= now
             }
@@ -455,13 +486,19 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                                 val decoded = json.decodeFromString<PlaybackV4Response>(body)
                                 parsed = decoded
                                 resolvedTargetId = targetId
-                                playbackCache[targetId] = Pair(targetId, decoded)
+                                val cachedAt = System.currentTimeMillis()
+                                val entry = CachedPlayback(targetId, decoded, cachedAt)
+                                if (playbackCache.size >= 32) {
+                                    playbackCache.entries.removeIf { cachedAt - it.value.cachedAtMs >= PLAYBACK_CACHE_TTL_MS }
+                                }
+                                playbackCache[targetId] = entry
                                 if (isSpecificDub && !epData.versionGuid.isNullOrBlank()) {
-                                    playbackCache[epData.versionGuid] = Pair(targetId, decoded)
+                                    playbackCache[epData.versionGuid] = entry
                                 }
                                 failedTargets.remove(targetId)
                             }
                         } else {
+                            lastHttpFailure = r.code
                             Log.w(TAG, "Play endpoint failed: $playUrl -> HTTP ${r.code}")
                             if (r.code == 420 || r.code == 429 || r.code == 403) {
                                 failedTargets[targetId] = System.currentTimeMillis() + 60_000L
@@ -478,9 +515,17 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             }
         }
 
-        val nonNullParsed = parsed ?: throw IllegalStateException("Audio dub is unavailable or region-locked")
+        val nonNullParsed = parsed ?: when {
+            lastHttpFailure == 403 && targetVersion?.isPremiumOnly == true && !auth.isUserLoggedIn() ->
+                throw IllegalStateException("Premium episode requires logging into Crunchyroll in extension settings or WebView")
+            lastHttpFailure == 403 ->
+                throw IllegalStateException("Audio dub is unavailable or region-locked (HTTP 403)")
+            else ->
+                throw IllegalStateException("Audio dub is unavailable or region-locked")
+        }
         if (!isSpecificDub && epData.episodeId.isNotBlank()) {
-            playbackCache[epData.episodeId] = Pair(resolvedTargetId, nonNullParsed)
+            val cachedAt = System.currentTimeMillis()
+            playbackCache[epData.episodeId] = CachedPlayback(resolvedTargetId, nonNullParsed, cachedAt)
         }
 
         return Pair(resolvedTargetId, nonNullParsed)
@@ -493,12 +538,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val (resolvedTargetId, nonNullParsed) = getPlayback(epData)
 
-        val isSpecificDub = !epData.versionGuid.isNullOrBlank()
-        val targetVersion = if (isSpecificDub) {
-            epData.availableVersions.firstOrNull { it.guid == epData.versionGuid }
-        } else {
-            epData.availableVersions.firstOrNull { it.original } ?: epData.availableVersions.firstOrNull()
-        }
+        val targetVersion = resolveTargetVersion(epData)
 
         val dashUrl = nonNullParsed.url.ifBlank {
             nonNullParsed.hardSubs?.get("en-US")?.url
@@ -518,7 +558,9 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             Track(sub.url, lang)
         } ?: emptyList()
 
-        val versionsList = nonNullParsed.versions?.ifEmpty { null } ?: epData.availableVersions
+        val versionsList = (nonNullParsed.versions?.ifEmpty { null } ?: epData.availableVersions)
+            .filter { it.guid.isNotBlank() }
+            .distinctBy { it.guid }
         val audioTracks = if (versionsList.isNotEmpty()) {
             versionsList.map { ver ->
                 val langDisplay = getLanguageDisplayName(ver.audio_locale) + (if (ver.original) " (Original)" else " Dub")
@@ -961,6 +1003,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     private companion object {
         private const val TAG = "MiruRoll"
         private const val PAGE_SIZE = 24
+        private const val PLAYBACK_CACHE_TTL_MS = 5 * 60_000L
         private val DEFAULT_QUALITIES = listOf(1080, 720, 480, 360, 240)
     }
 }
