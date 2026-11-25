@@ -5,9 +5,11 @@ import android.util.Log
 import android.webkit.CookieManager
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Interceptor
@@ -18,7 +20,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
+import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 class MiruRollAuth(
     private val preferences: SharedPreferences,
@@ -26,6 +30,9 @@ class MiruRollAuth(
 ) : Interceptor {
 
     private val authClient = OkHttpClient.Builder().build()
+    private val authEpoch = AtomicLong(0L)
+
+    fun getAuthEpoch(): Long = authEpoch.get()
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -94,15 +101,19 @@ class MiruRollAuth(
         }.getOrNull()
     }
 
+    private fun getOrCreateDeviceId(): String =
+        preferences.getString(KEY_DEVICE_ID, null)?.ifBlank { null }
+            ?: UUID.randomUUID().toString().also {
+                preferences.edit().putString(KEY_DEVICE_ID, it).apply()
+            }
+
     @Synchronized
     fun getAccessToken(forceRefresh: Boolean = false): String {
         val cachedToken = preferences.getString(KEY_ACCESS_TOKEN, null)
         val expiryTime = preferences.getLong(KEY_TOKEN_EXPIRY, 0L)
         val isCachedGuest = preferences.getBoolean(KEY_IS_GUEST, false)
 
-        val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
-            preferences.edit().putString(KEY_DEVICE_ID, it).apply()
-        }
+        getOrCreateDeviceId()
 
         val webViewRefreshToken = getRefreshTokenFromWebView()
         val customRefreshToken = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)?.trim()
@@ -126,16 +137,18 @@ class MiruRollAuth(
 
         val activeProfileId = preferences.getString(KEY_PROFILE_ID, null)
         val activePin = preferences.getString(PREF_PROFILE_PIN, null)?.trim()
-        val storedRt = preferences.getString(KEY_REFRESH_TOKEN, null)?.trim()
-            ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)?.trim()
-            ?: webViewRefreshToken
+        val storedRt = storedRefreshToken?.ifBlank { null }
+            ?: customRefreshToken?.ifBlank { null }
+            ?: webViewRefreshToken?.ifBlank { null }
 
         // Maintain the active profile across routine background token refreshes
         if (!hasNewWebViewSession && !activeProfileId.isNullOrBlank() && !storedRt.isNullOrBlank() && !isCachedGuest) {
             Log.d(TAG, "Refreshing access token for active profile: $activeProfileId")
-            val switchResult = switchProfile(activeProfileId, activePin)
+            val switchResult = switchProfileInternal(activeProfileId, activePin, storedRt)
             if (switchResult.isSuccess) {
-                return preferences.getString(KEY_ACCESS_TOKEN, null)!!
+                preferences.getString(KEY_ACCESS_TOKEN, null)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { return it }
             } else {
                 Log.w(TAG, "Failed to refresh token for active profile, falling back to base auth", switchResult.exceptionOrNull())
             }
@@ -144,6 +157,7 @@ class MiruRollAuth(
         return obtainBaseAccessToken()
     }
 
+    @Synchronized
     private fun obtainBaseAccessToken(): String {
         val webViewRefreshToken = getRefreshTokenFromWebView()
         val customRefreshToken = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)?.trim()
@@ -151,78 +165,80 @@ class MiruRollAuth(
         val isCachedGuest = preferences.getBoolean(KEY_IS_GUEST, false)
         val userEmail = preferences.getString(PREF_EMAIL, null)?.trim()
         val userPass = preferences.getString(PREF_PASSWORD, null)
-        val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
-            preferences.edit().putString(KEY_DEVICE_ID, it).apply()
+        val deviceId = getOrCreateDeviceId()
+
+        val lastWebViewRt = preferences.getString(KEY_LAST_WEBVIEW_RT, null)
+        val hasNewWebViewSession = !webViewRefreshToken.isNullOrBlank() && webViewRefreshToken != lastWebViewRt
+
+        val attempts = buildList<Pair<String, () -> TokenResponse>> {
+            if (hasNewWebViewSession && !webViewRefreshToken.isNullOrBlank()) {
+                add("WebView etp_rt cookie" to { requestWebCookieToken(webViewRefreshToken, deviceId) })
+            }
+            if (!customRefreshToken.isNullOrBlank()) {
+                add("custom refresh token" to { requestRefreshToken(customRefreshToken, deviceId) })
+            }
+            if (!storedRefreshToken.isNullOrBlank() && (!isCachedGuest || !hasNewWebViewSession)) {
+                add("stored refresh token" to { requestRefreshToken(storedRefreshToken, deviceId) })
+            }
+            if (!hasNewWebViewSession && !webViewRefreshToken.isNullOrBlank()) {
+                add("WebView etp_rt cookie" to { requestWebCookieToken(webViewRefreshToken, deviceId) })
+            }
+            if (!userEmail.isNullOrBlank() && !userPass.isNullOrBlank()) {
+                add("user credentials" to { requestPasswordSignIn(userEmail, userPass, deviceId) })
+            }
         }
 
+        var finalResponse: TokenResponse? = null
         var isGuest = false
-        val finalResponse = when {
-            !webViewRefreshToken.isNullOrBlank() -> {
-                Log.d(TAG, "Authenticating using WebView etp_rt cookie")
-                runCatching { requestWebCookieToken(webViewRefreshToken, deviceId) }.getOrElse { e ->
-                    Log.w(TAG, "WebView token exchange failed, falling back to guest", e)
-                    isGuest = true
-                    requestGuestToken(deviceId)
-                }
+        for ((label, attempt) in attempts) {
+            Log.d(TAG, "Authenticating using $label")
+            val result = runCatching { attempt() }
+            if (result.isSuccess) {
+                finalResponse = result.getOrThrow()
+                break
             }
-            !customRefreshToken.isNullOrBlank() -> {
-                Log.d(TAG, "Authenticating using custom refresh token")
-                runCatching { requestRefreshToken(customRefreshToken, deviceId) }.getOrElse { e ->
-                    Log.w(TAG, "Custom refresh token failed, falling back to guest", e)
-                    isGuest = true
-                    requestGuestToken(deviceId)
-                }
-            }
-            !storedRefreshToken.isNullOrBlank() && !isCachedGuest -> {
-                Log.d(TAG, "Authenticating using stored refresh token")
-                runCatching { requestRefreshToken(storedRefreshToken, deviceId) }.getOrElse { e ->
-                    Log.w(TAG, "Stored refresh token failed, falling back to guest", e)
-                    isGuest = true
-                    requestGuestToken(deviceId)
-                }
-            }
-            !userEmail.isNullOrBlank() && !userPass.isNullOrBlank() -> {
-                Log.d(TAG, "Authenticating using user credentials")
-                runCatching { requestPasswordSignIn(userEmail, userPass, deviceId) }.getOrElse { e ->
-                    Log.w(TAG, "Password auth failed, falling back to guest", e)
-                    isGuest = true
-                    requestGuestToken(deviceId)
-                }
-            }
-            else -> {
-                Log.d(TAG, "Authenticating as guest")
-                isGuest = true
-                requestGuestToken(deviceId)
-            }
+            Log.w(TAG, "$label authentication failed, trying next available method", result.exceptionOrNull())
         }
 
-        val expiresAt = System.currentTimeMillis() + ((finalResponse.expires_in - 60) * 1000)
+        if (finalResponse == null) {
+            Log.d(TAG, "Authenticating as guest")
+            isGuest = true
+            finalResponse = requestGuestToken(deviceId)
+        }
+
+        val ttlMs = if (isGuest && attempts.isNotEmpty()) {
+            minOf((finalResponse.expires_in - 60).coerceAtLeast(15L) * 1000L, 30_000L)
+        } else {
+            (finalResponse.expires_in - 60).coerceAtLeast(15L) * 1000L
+        }
+        val expiresAt = System.currentTimeMillis() + ttlMs
 
         val editor = preferences.edit()
             .putString(KEY_ACCESS_TOKEN, finalResponse.access_token)
             .putLong(KEY_TOKEN_EXPIRY, expiresAt)
             .putBoolean(KEY_IS_GUEST, isGuest)
 
-        if (!webViewRefreshToken.isNullOrBlank()) {
+        if (!webViewRefreshToken.isNullOrBlank() && !isGuest) {
             editor.putString(KEY_LAST_WEBVIEW_RT, webViewRefreshToken)
         }
         if (!finalResponse.refresh_token.isNullOrBlank()) {
             editor.putString(KEY_REFRESH_TOKEN, finalResponse.refresh_token)
         }
         val tokenAccountId = finalResponse.account_id
-            ?: extractJwtClaim(finalResponse.access_token, "account_id")
-            ?: extractJwtClaim(finalResponse.access_token, "etp_user_id")
-            ?: extractJwtClaim(finalResponse.access_token, "profile_id")
-            ?: extractJwtClaim(finalResponse.access_token, "sub")
+            ?: parseJwtClaim(finalResponse.access_token, "account_id")
+            ?: parseJwtClaim(finalResponse.access_token, "etp_user_id")
+            ?: parseJwtClaim(finalResponse.access_token, "profile_id")
+            ?: parseJwtClaim(finalResponse.access_token, "sub")
         if (!tokenAccountId.isNullOrBlank()) {
             editor.putString(KEY_ACCOUNT_ID, tokenAccountId)
         }
         val tokenProfileId = finalResponse.profile_id
-            ?: extractJwtClaim(finalResponse.access_token, "profile_id")
+            ?: parseJwtClaim(finalResponse.access_token, "profile_id")
         if (!tokenProfileId.isNullOrBlank() && preferences.getString(KEY_PROFILE_ID, null).isNullOrBlank()) {
             editor.putString(KEY_PROFILE_ID, tokenProfileId)
         }
         editor.apply()
+        authEpoch.incrementAndGet()
 
         return finalResponse.access_token
     }
@@ -234,6 +250,16 @@ class MiruRollAuth(
             return currentToken
         }
         return obtainBaseAccessToken()
+    }
+
+    private fun executeTokenRequest(request: Request, errorPrefix: String): TokenResponse {
+        authClient.newCall(request).execute().use { response ->
+            val body = response.body.string()
+            if (!response.isSuccessful) {
+                throw IllegalStateException("$errorPrefix (HTTP ${response.code}): $body")
+            }
+            return json.decodeFromString<TokenResponse>(body)
+        }
     }
 
     private fun requestWebCookieToken(etpRt: String, deviceId: String): TokenResponse {
@@ -256,14 +282,7 @@ class MiruRollAuth(
             .post(formBody)
             .build()
 
-        val response = authClient.newCall(request).execute()
-        val body = response.body.string()
-
-        if (!response.isSuccessful) {
-            throw IllegalStateException("Crunchyroll Web Auth Error (HTTP ${response.code}): $body")
-        }
-
-        return json.decodeFromString<TokenResponse>(body)
+        return executeTokenRequest(request, "Crunchyroll Web Auth Error")
     }
 
     private fun requestRefreshToken(refreshToken: String, deviceId: String): TokenResponse {
@@ -276,7 +295,21 @@ class MiruRollAuth(
             .add("device_type", "Android")
             .build()
 
-        return executeAndroidAuthRequest(formBody)
+        return runCatching {
+            executeTokenRequest(
+                buildTokenFormRequest(formBody, ANDROID_BASIC_AUTH_HEADER),
+                "Crunchyroll Android Auth Error",
+            )
+        }.getOrElse { firstErr ->
+            if (firstErr.message?.contains("client_id") == true || firstErr.message?.contains("invalid_client") == true) {
+                executeTokenRequest(
+                    buildTokenFormRequest(formBody, WEB_BASIC_AUTH_HEADER),
+                    "Crunchyroll Web Refresh Auth Error",
+                )
+            } else {
+                throw firstErr
+            }
+        }
     }
 
     private fun requestPasswordSignIn(email: String, pass: String, deviceId: String): TokenResponse {
@@ -304,31 +337,28 @@ class MiruRollAuth(
         return executeAndroidAuthRequest(formBody)
     }
 
-    private fun executeAndroidAuthRequest(formBody: FormBody): TokenResponse {
-        val request = Request.Builder()
+    private fun buildTokenFormRequest(formBody: FormBody, authHeader: String): Request =
+        Request.Builder()
             .url("https://beta-api.crunchyroll.com/auth/v1/token")
             .headers(
                 Headers.headersOf(
                     "User-Agent", USER_AGENT,
-                    "Authorization", ANDROID_BASIC_AUTH_HEADER,
+                    "Authorization", authHeader,
                     "Content-Type", "application/x-www-form-urlencoded",
                 ),
             )
             .post(formBody)
             .build()
 
-        val response = authClient.newCall(request).execute()
-        val body = response.body.string()
+    private fun executeAndroidAuthRequest(formBody: FormBody): TokenResponse =
+        executeTokenRequest(
+            buildTokenFormRequest(formBody, ANDROID_BASIC_AUTH_HEADER),
+            "Crunchyroll Android Auth Error",
+        )
 
-        if (!response.isSuccessful) {
-            throw IllegalStateException("Crunchyroll Android Auth Error (HTTP ${response.code}): $body")
-        }
+    fun fetchProfiles(): List<CrProfile> = fetchProfilesWithToken(getAccessToken())
 
-        return json.decodeFromString<TokenResponse>(body)
-    }
-
-    fun fetchProfiles(): List<CrProfile> {
-        val token = getAccessToken()
+    private fun fetchProfilesWithToken(token: String): List<CrProfile> {
         val request = Request.Builder()
             .url("https://beta-api.crunchyroll.com/accounts/v1/me/multiprofile")
             .headers(
@@ -340,10 +370,12 @@ class MiruRollAuth(
             .get()
             .build()
 
-        val response = authClient.newCall(request).execute()
-        val body = response.body.string()
-        if (!response.isSuccessful) {
-            throw IllegalStateException("Failed to fetch profiles (HTTP ${response.code}): $body")
+        val body = authClient.newCall(request).execute().use { response ->
+            val raw = response.body.string()
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Failed to fetch profiles (HTTP ${response.code}): $raw")
+            }
+            raw
         }
 
         val parsed = json.decodeFromString<AllProfilesResponse>(body)
@@ -389,13 +421,22 @@ class MiruRollAuth(
         return getCachedProfiles().find { it.profileId == activeId }?.preferredAudioLanguage
     }
 
-    fun switchProfile(profileId: String, pin: String? = null): Result<CrProfile> {
+    @Synchronized
+    fun switchProfile(profileId: String, pin: String? = null): Result<CrProfile> =
+        switchProfileInternal(profileId = profileId, pin = pin, explicitRefreshToken = null)
+
+    private fun switchProfileInternal(
+        profileId: String,
+        pin: String?,
+        explicitRefreshToken: String?,
+    ): Result<CrProfile> {
         return runCatching {
-            var refreshToken = preferences.getString(KEY_REFRESH_TOKEN, null)
+            var refreshToken = explicitRefreshToken
+                ?: preferences.getString(KEY_REFRESH_TOKEN, null)
                 ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
 
             if (refreshToken.isNullOrBlank()) {
-                getAccessToken()
+                obtainBaseAccessToken()
                 refreshToken = preferences.getString(KEY_REFRESH_TOKEN, null)
                     ?: preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
             }
@@ -404,22 +445,22 @@ class MiruRollAuth(
                 throw IllegalStateException("No refresh token available to switch profile. Please log in again.")
             }
 
-            val deviceId = preferences.getString(KEY_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
-                preferences.edit().putString(KEY_DEVICE_ID, it).apply()
-            }
+            val deviceId = getOrCreateDeviceId()
 
             val effectivePin = pin?.trim()?.ifBlank { null }
                 ?: preferences.getString(PREF_PROFILE_PIN, null)?.trim()?.ifBlank { null }
 
             var cachedProfiles = getCachedProfiles()
             if (cachedProfiles.isEmpty()) {
-                cachedProfiles = runCatching { fetchProfiles() }.getOrDefault(emptyList())
+                cachedProfiles = runCatching {
+                    fetchProfilesWithToken(getValidAccessToken())
+                }.getOrDefault(emptyList())
             }
             val targetProfile = cachedProfiles.find { it.profileId == profileId }
             val isPinProtected = targetProfile?.isPinProtected == true
 
             if (isPinProtected && effectivePin.isNullOrBlank()) {
-                throw IllegalStateException("Profile '${targetProfile?.profileName ?: profileId}' is PIN-protected. Please set your PIN in 'Profile PIN (Optional)' setting first.")
+                throw IllegalStateException("Profile '${targetProfile.profileName}' is PIN-protected. Please set your PIN in 'Profile PIN (Optional)' setting first.")
             }
 
             var passToken: String? = null
@@ -427,8 +468,8 @@ class MiruRollAuth(
             if (isPinProtected && !effectivePin.isNullOrBlank()) {
                 val currentToken = getValidAccessToken()
                 if (accountId.isNullOrBlank()) {
-                    accountId = extractJwtClaim(currentToken, "account_id")
-                        ?: extractJwtClaim(currentToken, "sub")
+                    accountId = parseJwtClaim(currentToken, "account_id")
+                        ?: parseJwtClaim(currentToken, "sub")
                 }
                 if (!accountId.isNullOrBlank()) {
                     passToken = requestProfilePassToken(currentToken, accountId, profileId, effectivePin)
@@ -449,7 +490,7 @@ class MiruRollAuth(
             val primaryAuth = if (isWebViewSession) WEB_BASIC_AUTH_HEADER else ANDROID_BASIC_AUTH_HEADER
             val fallbackAuth = if (isWebViewSession) ANDROID_BASIC_AUTH_HEADER else WEB_BASIC_AUTH_HEADER
 
-            fun executeSwitch(authHeader: String): Response {
+            fun executeSwitch(authHeader: String): Pair<Int, String> {
                 val req = Request.Builder()
                     .url("https://beta-api.crunchyroll.com/auth/v1/token")
                     .headers(
@@ -464,26 +505,28 @@ class MiruRollAuth(
                 if (!passToken.isNullOrBlank()) {
                     req.addHeader("CrPassToken", passToken)
                 }
-                return authClient.newCall(req.build()).execute()
-            }
-
-            var response = executeSwitch(primaryAuth)
-            var body = response.body.string()
-
-            if (!response.isSuccessful && body.contains("client_id")) {
-                response = executeSwitch(fallbackAuth)
-                body = response.body.string()
-            }
-
-            if (!response.isSuccessful) {
-                if (body.contains("invalid_credentials") || body.contains("invalid_grant")) {
-                    throw IllegalStateException("Switch profile failed: Profile may require a PIN or session expired. (HTTP ${response.code})")
+                return authClient.newCall(req.build()).execute().use { resp ->
+                    resp.code to resp.body.string()
                 }
-                throw IllegalStateException("Switch profile failed (HTTP ${response.code}): $body")
+            }
+
+            var (statusCode, body) = executeSwitch(primaryAuth)
+
+            if (statusCode !in 200..299 && body.contains("client_id")) {
+                val retry = executeSwitch(fallbackAuth)
+                statusCode = retry.first
+                body = retry.second
+            }
+
+            if (statusCode !in 200..299) {
+                if (body.contains("invalid_credentials") || body.contains("invalid_grant")) {
+                    throw IllegalStateException("Switch profile failed: Profile may require a PIN or session expired. (HTTP $statusCode)")
+                }
+                throw IllegalStateException("Switch profile failed (HTTP $statusCode): $body")
             }
 
             val tokenResponse = json.decodeFromString<TokenResponse>(body)
-            val expiresAt = System.currentTimeMillis() + ((tokenResponse.expires_in - 60) * 1000)
+            val expiresAt = System.currentTimeMillis() + ((tokenResponse.expires_in - 60).coerceAtLeast(15L) * 1000L)
 
             val targetName = targetProfile?.profileName ?: "Profile"
 
@@ -499,10 +542,10 @@ class MiruRollAuth(
                 editor.putString(KEY_REFRESH_TOKEN, tokenResponse.refresh_token)
             }
             val newAccountId = tokenResponse.account_id
-                ?: extractJwtClaim(tokenResponse.access_token, "account_id")
-                ?: extractJwtClaim(tokenResponse.access_token, "etp_user_id")
-                ?: extractJwtClaim(tokenResponse.access_token, "profile_id")
-                ?: extractJwtClaim(tokenResponse.access_token, "sub")
+                ?: parseJwtClaim(tokenResponse.access_token, "account_id")
+                ?: parseJwtClaim(tokenResponse.access_token, "etp_user_id")
+                ?: parseJwtClaim(tokenResponse.access_token, "profile_id")
+                ?: parseJwtClaim(tokenResponse.access_token, "sub")
             if (!newAccountId.isNullOrBlank()) {
                 editor.putString(KEY_ACCOUNT_ID, newAccountId)
             }
@@ -516,29 +559,22 @@ class MiruRollAuth(
             }
 
             editor.apply()
+            authEpoch.incrementAndGet()
 
             targetProfile?.copy(isSelected = true)
                 ?: CrProfile(profileId = profileId, profileName = targetName, isSelected = true)
         }
     }
 
-    private fun extractJwtClaim(jwt: String, claimKey: String): String? {
-        return runCatching {
-            val parts = jwt.split(".")
-            if (parts.size >= 2) {
-                val payloadBytes = android.util.Base64.decode(
-                    parts[1],
-                    android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
-                )
-                val jsonStr = String(payloadBytes, StandardCharsets.UTF_8)
-                val obj = json.parseToJsonElement(jsonStr).jsonObject
-                obj[claimKey]?.jsonPrimitive?.contentOrNull
-            } else null
-        }.getOrNull()
-    }
+    private fun parseJwtClaim(jwt: String, claimKey: String): String? =
+        extractJwtClaim(json, jwt, claimKey)
 
     private fun requestProfilePassToken(accessToken: String, accountId: String, profileId: String, pin: String): String {
-        val jsonBody = """{"credential_type":"profile_pin","profile_id":"$profileId","value":"$pin"}"""
+        val jsonBody = buildJsonObject {
+            put("credential_type", "profile_pin")
+            put("profile_id", profileId)
+            put("value", pin)
+        }.toString()
         val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
         val request = Request.Builder()
             .url("https://beta-api.crunchyroll.com/auth/v1/$accountId/passtoken")
@@ -552,13 +588,15 @@ class MiruRollAuth(
             .post(jsonBody.toRequestBody(mediaType))
             .build()
 
-        val response = authClient.newCall(request).execute()
-        val body = response.body.string()
-        if (!response.isSuccessful) {
-            if (body.contains("failed_pass_token_credentials") || body.contains("invalid_credential")) {
-                throw IllegalStateException("Incorrect Profile PIN entered")
+        val body = authClient.newCall(request).execute().use { response ->
+            val raw = response.body.string()
+            if (!response.isSuccessful) {
+                if (raw.contains("failed_pass_token_credentials") || raw.contains("invalid_credential")) {
+                    throw IllegalStateException("Incorrect Profile PIN entered")
+                }
+                throw IllegalStateException("PIN verification failed (HTTP ${response.code}): $raw")
             }
-            throw IllegalStateException("PIN verification failed (HTTP ${response.code}): $body")
+            raw
         }
         val token = json.decodeFromString<PassTokenResponse>(body).effectiveToken
         if (token.isBlank()) {
@@ -568,7 +606,12 @@ class MiruRollAuth(
     }
 
     fun isUserLoggedIn(): Boolean {
-        if (preferences.getBoolean(KEY_IS_GUEST, false)) return false
+        if (preferences.getBoolean(KEY_IS_GUEST, false)) {
+            val webViewRt = getRefreshTokenFromWebView()
+            val email = preferences.getString(PREF_EMAIL, null)
+            val customRt = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
+            return !webViewRt.isNullOrBlank() || !email.isNullOrBlank() || !customRt.isNullOrBlank()
+        }
         val webViewRt = getRefreshTokenFromWebView()
         val email = preferences.getString(PREF_EMAIL, null)
         val customRt = preferences.getString(PREF_CUSTOM_REFRESH_TOKEN, null)
@@ -576,6 +619,7 @@ class MiruRollAuth(
         return (!webViewRt.isNullOrBlank()) || (!email.isNullOrBlank()) || (!customRt.isNullOrBlank()) || (!rt.isNullOrBlank())
     }
 
+    @Synchronized
     fun clearSession() {
         preferences.edit()
             .remove(KEY_ACCESS_TOKEN)
@@ -588,16 +632,18 @@ class MiruRollAuth(
             .remove(KEY_PROFILE_NAME)
             .remove(KEY_PROFILES_JSON)
             .apply()
+        authEpoch.incrementAndGet()
     }
 
+    @Synchronized
     fun getAccountId(): String? {
         val stored = preferences.getString(KEY_ACCOUNT_ID, null)
         if (!stored.isNullOrBlank()) return stored
         val token = runCatching { getAccessToken() }.getOrNull() ?: return null
-        return extractJwtClaim(token, "account_id")
-            ?: extractJwtClaim(token, "etp_user_id")
-            ?: extractJwtClaim(token, "profile_id")
-            ?: extractJwtClaim(token, "sub")
+        return parseJwtClaim(token, "account_id")
+            ?: parseJwtClaim(token, "etp_user_id")
+            ?: parseJwtClaim(token, "profile_id")
+            ?: parseJwtClaim(token, "sub")
     }
 
     fun deleteWatchHistory(episodeId: String): Result<Unit> = runCatching {
@@ -754,5 +800,14 @@ class MiruRollAuth(
         const val PREF_CUSTOM_REFRESH_TOKEN = "cr_pref_custom_refresh_token"
         const val PREF_ACTIVE_PROFILE = "cr_pref_active_profile"
         const val PREF_PROFILE_PIN = "cr_pref_profile_pin"
+
+        internal fun extractJwtClaim(json: Json, jwt: String, claimKey: String): String? =
+            runCatching {
+                val parts = jwt.split(".")
+                if (parts.size < 2) return null
+                val payloadBytes = Base64.getUrlDecoder().decode(parts[1])
+                val jsonStr = String(payloadBytes, StandardCharsets.UTF_8)
+                json.parseToJsonElement(jsonStr).jsonObject[claimKey]?.jsonPrimitive?.contentOrNull
+            }.getOrNull()
     }
 }
