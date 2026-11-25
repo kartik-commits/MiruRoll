@@ -163,13 +163,15 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             if (fetchDetails && url.startsWith("/series/")) {
                 val seriesId = url.removePrefix("/series/")
                 runCatching {
-                    val resp = client.newCall(GET("$baseUrl/content/v2/cms/series/$seriesId?locale=en-US")).execute()
-                    val details = json.decodeFromString<BrowseResponse>(resp.body.string())
-                    details.data.firstOrNull()?.let { info ->
-                        title = info.title
-                        description = info.description
-                        thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
-                        status = SAnime.UNKNOWN
+                    client.newCall(GET("$baseUrl/content/v2/cms/series/$seriesId?locale=en-US")).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use
+                        val details = json.decodeFromString<BrowseResponse>(resp.body.string())
+                        details.data.firstOrNull()?.let { info ->
+                            title = info.title
+                            description = info.description
+                            thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
+                            status = SAnime.UNKNOWN
+                        }
                     }
                 }
                 initialized = true
@@ -178,8 +180,15 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val childSeasons = if (fetchSeasons && anime.url.startsWith("/series/")) {
             val seriesId = anime.url.removePrefix("/series/")
-            val resp = client.newCall(GET("$baseUrl/content/v2/cms/series/$seriesId/seasons?locale=en-US")).execute()
-            val parsedSeasons = json.decodeFromString<SeasonsResponse>(resp.body.string())
+            val body = client.newCall(GET("$baseUrl/content/v2/cms/series/$seriesId/seasons?locale=en-US"))
+                .execute()
+                .use { resp ->
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException("Failed to fetch seasons (HTTP ${resp.code})")
+                    }
+                    resp.body.string()
+                }
+            val parsedSeasons = json.decodeFromString<SeasonsResponse>(body)
             parsedSeasons.data.sortedBy { it.sequenceNumber }.map { season ->
                 SAnime.create().apply {
                     url = "/season/${season.id}"
@@ -211,8 +220,15 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val childEpisodes = if (fetchEpisodes && anime.url.startsWith("/season/")) {
             val seasonId = anime.url.removePrefix("/season/")
-            val resp = client.newCall(GET("$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=en-US")).execute()
-            val parsedEpisodes = json.decodeFromString<EpisodesResponse>(resp.body.string())
+            val body = client.newCall(GET("$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=en-US"))
+                .execute()
+                .use { resp ->
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException("Failed to fetch episodes (HTTP ${resp.code})")
+                    }
+                    resp.body.string()
+                }
+            val parsedEpisodes = json.decodeFromString<EpisodesResponse>(body)
 
             val allCandidateIds = parsedEpisodes.data.flatMap { ep ->
                 listOf(ep.id) + (ep.versions?.map { it.guid } ?: emptyList())
@@ -604,29 +620,32 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         return candidates.distinct()
     }
 
-    fun getPlayhead(episodeUrl: String): Long {
-        if (!preferences.getBoolean("cr_pref_sync_history", true)) return 0L
-        if (!auth.isUserLoggedIn()) return 0L
+    private fun fetchBestPlayhead(episodeUrl: String): CrPlayhead? {
+        if (!preferences.getBoolean("cr_pref_sync_history", true)) return null
+        if (!auth.isUserLoggedIn()) return null
         val epData = runCatching {
             json.decodeFromString<MiruEpisodeData>(episodeUrl)
-        }.getOrNull() ?: return 0L
+        }.getOrNull() ?: return null
         val candidateIds = getCandidateEpisodeIds(epData)
         val playheads = auth.getPlayheads(candidateIds)
-        val best = playheads.values.firstOrNull { it.fullyWatched }
+        return playheads.values.firstOrNull { it.fullyWatched }
             ?: playheads.values.maxByOrNull { it.playhead }
-        return best?.playhead ?: 0L
     }
 
-    fun isEpisodeFullyWatched(episodeUrl: String): Boolean {
-        if (!preferences.getBoolean("cr_pref_sync_history", true)) return false
-        if (!auth.isUserLoggedIn()) return false
-        val epData = runCatching {
-            json.decodeFromString<MiruEpisodeData>(episodeUrl)
-        }.getOrNull() ?: return false
-        val candidateIds = getCandidateEpisodeIds(epData)
-        val playheads = auth.getPlayheads(candidateIds)
-        return playheads.values.any { it.fullyWatched }
+    /** Single-call fast path used by Animiru SourcePlayheadSync: `[playheadSeconds, isFullyWatchedFlag]`. */
+    fun getPlayheadState(episodeUrl: String): LongArray {
+        val best = fetchBestPlayhead(episodeUrl) ?: return longArrayOf(0L, 0L)
+        return longArrayOf(
+            best.playhead.coerceAtLeast(0L),
+            if (best.fullyWatched) 1L else 0L,
+        )
     }
+
+    fun getPlayhead(episodeUrl: String): Long =
+        fetchBestPlayhead(episodeUrl)?.playhead ?: 0L
+
+    fun isEpisodeFullyWatched(episodeUrl: String): Boolean =
+        fetchBestPlayhead(episodeUrl)?.fullyWatched == true
 
     fun savePlayhead(episodeUrl: String, positionSeconds: Long, totalSeconds: Long, onComplete: Boolean) {
         if (!preferences.getBoolean("cr_pref_sync_history", true)) return
@@ -664,13 +683,20 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                     for (chunk in candidateIds.chunked(50)) {
                         val idsParam = chunk.joinToString(",")
                         Log.d(TAG, "Marking episode candidates $idsParam as watched on Crunchyroll")
-                        auth.markAsWatched(idsParam)
+                        auth.markAsWatched(idsParam).getOrThrow()
                     }
                 } else if (positionSeconds > 0) {
                     Log.d(TAG, "Saving playhead ${positionSeconds}s for episode $epId on Crunchyroll")
-                    auth.savePlayhead(epId, positionSeconds)
+                    auth.savePlayhead(epId, positionSeconds).getOrThrow()
                 }
             } catch (e: Exception) {
+                if (onComplete) {
+                    lastMarkedWatched.remove(epId, now)
+                    candidateIds.forEach { lastMarkedWatched.remove(it, now) }
+                } else {
+                    lastPlayheadSyncTime.remove(epId, now)
+                    lastPlayheadSyncPos.remove(epId, positionSeconds)
+                }
                 Log.w(TAG, "Failed to sync playhead for $epId", e)
             }
         }
@@ -695,7 +721,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                 for (chunk in candidateIds.chunked(50)) {
                     val idsParam = chunk.joinToString(",")
                     Log.d(TAG, "Deleting watch history for episodes $idsParam on Crunchyroll")
-                    auth.deleteWatchHistory(idsParam)
+                    auth.deleteWatchHistory(idsParam).getOrThrow()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to delete watch history for ${epData.episodeId}", e)
@@ -724,10 +750,10 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                     val idsParam = chunk.joinToString(",")
                     if (seen) {
                         Log.d(TAG, "Batch marking episodes $idsParam as watched on Crunchyroll")
-                        auth.markAsWatched(idsParam)
+                        auth.markAsWatched(idsParam).getOrThrow()
                     } else {
                         Log.d(TAG, "Batch deleting watch history for episodes $idsParam on Crunchyroll")
-                        auth.deleteWatchHistory(idsParam)
+                        auth.deleteWatchHistory(idsParam).getOrThrow()
                     }
                 }
             } catch (e: Exception) {

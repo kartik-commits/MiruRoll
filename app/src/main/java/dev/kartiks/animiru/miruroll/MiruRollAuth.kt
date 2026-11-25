@@ -22,6 +22,7 @@ import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class MiruRollAuth(
@@ -29,7 +30,11 @@ class MiruRollAuth(
     private val json: Json,
 ) : Interceptor {
 
-    private val authClient = OkHttpClient.Builder().build()
+    private val authClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .build()
     private val authEpoch = AtomicLong(0L)
 
     fun getAuthEpoch(): Long = authEpoch.get()
@@ -646,6 +651,19 @@ class MiruRollAuth(
             ?: parseJwtClaim(token, "sub")
     }
 
+    private fun executeAccountRequest(
+        request: Request,
+        actionName: String,
+        acceptedCodes: Set<Int> = setOf(204),
+    ) {
+        authClient.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful && resp.code !in acceptedCodes) {
+                val err = resp.body.string()
+                throw IllegalStateException("Failed to $actionName (HTTP ${resp.code}): $err")
+            }
+        }
+    }
+
     fun deleteWatchHistory(episodeId: String): Result<Unit> = runCatching {
         val accountId = getAccountId() ?: throw IllegalStateException("No account ID available")
         val token = getAccessToken()
@@ -660,11 +678,7 @@ class MiruRollAuth(
             )
             .delete()
             .build()
-        val resp = authClient.newCall(req).execute()
-        if (!resp.isSuccessful && resp.code != 204 && resp.code != 404) {
-            val err = resp.body.string()
-            throw IllegalStateException("Failed to delete watch history (HTTP ${resp.code}): $err")
-        }
+        executeAccountRequest(req, "delete watch history", setOf(204, 404))
     }
 
     fun savePlayhead(episodeId: String, playheadSeconds: Long): Result<Unit> = runCatching {
@@ -685,11 +699,7 @@ class MiruRollAuth(
             )
             .post(body)
             .build()
-        val resp = authClient.newCall(req).execute()
-        if (!resp.isSuccessful && resp.code != 204) {
-            val err = resp.body.string()
-            throw IllegalStateException("Failed to save playhead (HTTP ${resp.code}): $err")
-        }
+        executeAccountRequest(req, "save playhead", setOf(204))
     }
 
     fun markAsWatched(episodeId: String): Result<Unit> = runCatching {
@@ -709,11 +719,7 @@ class MiruRollAuth(
             )
             .post(body)
             .build()
-        val resp = authClient.newCall(req).execute()
-        if (!resp.isSuccessful && resp.code != 204) {
-            val err = resp.body.string()
-            throw IllegalStateException("Failed to mark as watched (HTTP ${resp.code}): $err")
-        }
+        executeAccountRequest(req, "mark as watched", setOf(204))
     }
 
     fun getPlayheads(contentIds: List<String>): Map<String, CrPlayhead> {
@@ -734,13 +740,14 @@ class MiruRollAuth(
                     )
                     .get()
                     .build()
-                val resp = authClient.newCall(req).execute()
-                if (resp.isSuccessful) {
-                    val respBody = resp.body.string()
-                    val decoded = json.decodeFromString<PlayheadResponse>(respBody)
-                    decoded.data
-                } else {
-                    emptyList()
+                authClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val respBody = resp.body.string()
+                        val decoded = json.decodeFromString<PlayheadResponse>(respBody)
+                        decoded.data
+                    } else {
+                        emptyList()
+                    }
                 }
             }.associateBy { it.contentId }
         }.getOrDefault(emptyMap())
@@ -764,10 +771,12 @@ class MiruRollAuth(
             )
             .get()
             .build()
-        val resp = authClient.newCall(req).execute()
-        val body = resp.body.string()
-        if (!resp.isSuccessful) {
-            throw IllegalStateException("Failed to fetch watch history (HTTP ${resp.code}): $body")
+        val body = authClient.newCall(req).execute().use { resp ->
+            val raw = resp.body.string()
+            if (!resp.isSuccessful) {
+                throw IllegalStateException("Failed to fetch watch history (HTTP ${resp.code}): $raw")
+            }
+            raw
         }
         json.decodeFromString<WatchHistoryResponse>(body).data
     }
