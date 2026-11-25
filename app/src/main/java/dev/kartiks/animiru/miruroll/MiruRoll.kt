@@ -46,6 +46,8 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.time.Instant
+import java.time.OffsetDateTime
 
 class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
@@ -89,13 +91,25 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         return GET("$baseUrl/content/v2/discover/browse?start=$start&n=$PAGE_SIZE&sort_by=popularity&locale=en-US")
     }
 
+    private fun applyBrowseItemDetails(target: SAnime, info: BrowseItem) {
+        val isMovie = info.type == "movie_listing"
+        target.title = info.title
+        target.description = info.description
+        target.thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
+        val categories = if (isMovie) info.movieListingMetadata?.categories else info.seriesMetadata?.categories
+        formatGenres(categories.orEmpty())?.let { target.genre = it }
+        target.status = when {
+            isMovie -> SAnime.COMPLETED
+            info.seriesMetadata?.isSimulcast == true -> SAnime.ONGOING
+            else -> SAnime.UNKNOWN
+        }
+    }
+
     private fun BrowseItem.toSAnime(): SAnime = SAnime.create().apply {
         val isMovie = type == "movie_listing"
         url = if (isMovie) "/movie_listing/$id" else "/series/$id"
-        title = this@toSAnime.title
-        description = this@toSAnime.description
-        thumbnail_url = images?.posterTall?.firstOrNull()?.lastOrNull()?.source
         fetch_type = if (isMovie) FetchType.Episodes else FetchType.Seasons
+        applyBrowseItemDetails(this, this@toSAnime)
         initialized = true
     }
 
@@ -171,14 +185,11 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                         if (!resp.isSuccessful) return@use
                         val details = json.decodeFromString<BrowseResponse>(resp.body.string())
                         details.data.firstOrNull()?.let { info ->
-                            title = info.title
-                            description = info.description
-                            thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
-                            status = SAnime.UNKNOWN
+                            applyBrowseItemDetails(this, info)
+                            initialized = true
                         }
                     }
                 }
-                initialized = true
             }
         }
 
@@ -223,6 +234,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         versions: List<EpisodeVersion>,
         episodeNumber: Float,
         episodeName: String,
+        uploadDate: String?,
         playheads: Map<String, CrPlayhead>,
     ): SEpisode {
         val origVersion = versions.firstOrNull { it.original } ?: versions.firstOrNull()
@@ -242,7 +254,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             url = json.encodeToString(epData)
             name = episodeName
             episode_number = episodeNumber
-            scanlator = "Audio: $audioLocale"
+            date_upload = parseIsoDateMillis(uploadDate)
+            scanlator = formatAudioSummary(versions, audioLocale)
             if (crPlayhead != null) {
                 memo = buildJsonObject {
                     put("cr_playhead", JsonPrimitive(crPlayhead.playhead))
@@ -268,14 +281,12 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                             if (!resp.isSuccessful) return@use
                             val details = json.decodeFromString<BrowseResponse>(resp.body.string())
                             details.data.firstOrNull()?.let { info ->
-                                title = info.title
-                                description = info.description
-                                thumbnail_url = info.images?.posterTall?.firstOrNull()?.lastOrNull()?.source
+                                applyBrowseItemDetails(this, info)
                                 status = SAnime.COMPLETED
+                                initialized = true
                             }
                         }
                 }
-                initialized = true
             } else if (fetchDetails) {
                 initialized = true
             }
@@ -306,7 +317,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                     streamsLink = ep.streams_link,
                     versions = versions,
                     episodeNumber = ep.episodeNumber,
-                    episodeName = if (ep.episodeNumber > 0) "E${ep.episodeNumber.toInt()} - ${ep.title}" else ep.title,
+                    episodeName = formatEpisodeTitle(ep.episodeNumber, ep.episode, ep.title),
+                    uploadDate = ep.uploadDate,
                     playheads = playheads,
                 )
             }
@@ -342,6 +354,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                     versions = versions,
                     episodeNumber = movieNumber,
                     episodeName = displayName,
+                    uploadDate = movie.availableDate,
                     playheads = playheads,
                 )
             }
@@ -406,11 +419,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             val cacheKey = epData.versionGuid ?: epData.episodeId
             resolutionCache[cacheKey] ?: runCatching {
                 val (_, playback) = getPlayback(epData)
-                val dashUrl = playback.url.ifBlank {
-                    playback.hardSubs?.get("en-US")?.url
-                        ?: playback.hardSubs?.get("none")?.url
-                        ?: playback.hardSubs?.values?.firstOrNull()?.url
-                }
+                val dashUrl = extractStreamUrl(playback)
                 if (!dashUrl.isNullOrBlank()) {
                     val heights = fetchDashResolutions(dashUrl)
                     if (heights.isNotEmpty()) {
@@ -468,20 +477,16 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         val response = client.newCall(request).execute()
         response.use { r ->
             if (!r.isSuccessful) return@use emptyList()
-            val xml = r.body.string()
-            parseMpdResolutions(xml)
+            parseManifestResolutions(r.body.string())
         }
     }
 
-    private fun parseMpdResolutions(xml: String): List<Int> {
-        return Regex("""\bheight=["'](\d+)["']""")
-            .findAll(xml)
-            .mapNotNull { it.groupValues[1].toIntOrNull() }
-            .filter { it in 144..4320 }
-            .distinct()
-            .sortedDescending()
-            .toList()
-    }
+    private fun extractStreamUrl(playback: PlaybackV4Response): String? =
+        playback.url.ifBlank {
+            playback.hardSubs?.get("en-US")?.url
+                ?: playback.hardSubs?.get("none")?.url
+                ?: playback.hardSubs?.values?.firstOrNull()?.url
+        }?.ifBlank { null }
 
     private suspend fun getPlayback(epData: MiruEpisodeData): Pair<String, PlaybackV4Response> {
         invalidateCachesIfAuthChanged()
@@ -613,12 +618,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
         val targetVersion = resolveTargetVersion(epData)
 
-        val dashUrl = nonNullParsed.url.ifBlank {
-            nonNullParsed.hardSubs?.get("en-US")?.url
-                ?: nonNullParsed.hardSubs?.get("none")?.url
-                ?: nonNullParsed.hardSubs?.values?.firstOrNull()?.url
-                ?: throw IllegalStateException("No DASH playback URL found in response")
-        }
+        val dashUrl = extractStreamUrl(nonNullParsed)
+            ?: throw IllegalStateException("No DASH playback URL found in response")
 
         val licenseUrl = nonNullParsed.drm?.drmUrl?.ifBlank { null }
             ?: nonNullParsed.drms?.firstOrNull { it.name.equals("widevine", ignoreCase = true) }?.drmUrl?.ifBlank { null }
@@ -730,7 +731,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         epData.mediaGuid?.removeSuffix("V")?.let { if (it.isNotBlank()) candidates.add(it) }
         epData.availableVersions.forEach { v ->
             if (v.guid.isNotBlank()) candidates.add(v.guid)
-            v.mediaGuid?.removeSuffix("V")?.let { if (it.isNotBlank()) candidates.add(it) }
+            v.mediaGuid.removeSuffix("V").let { if (it.isNotBlank()) candidates.add(it) }
         }
         return candidates.distinct()
     }
@@ -1078,5 +1079,71 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         private const val PAGE_SIZE = 24
         private const val PLAYBACK_CACHE_TTL_MS = 5 * 60_000L
         private val DEFAULT_QUALITIES = listOf(1080, 720, 480, 360, 240)
+        private val MPD_HEIGHT_REGEX = Regex("""\bheight=["'](\d+)["']""")
+        private val HLS_RESOLUTION_REGEX = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
+
+        internal fun parseManifestResolutions(manifest: String): List<Int> {
+            val matches = MPD_HEIGHT_REGEX.findAll(manifest).toList().ifEmpty {
+                HLS_RESOLUTION_REGEX.findAll(manifest).toList()
+            }
+            return matches
+                .mapNotNull { it.groupValues[1].toIntOrNull() }
+                .filter { it in 144..4320 }
+                .distinct()
+                .sortedDescending()
+                .toList()
+        }
+
+        internal fun parseIsoDateMillis(isoDate: String?): Long {
+            val raw = isoDate?.trim()?.ifBlank { null } ?: return 0L
+            return runCatching {
+                OffsetDateTime.parse(raw).toInstant().toEpochMilli()
+            }.getOrElse {
+                runCatching { Instant.parse(raw).toEpochMilli() }.getOrDefault(0L)
+            }
+        }
+
+        internal fun formatEpisodeTitle(episodeNumber: Float, episodeLabel: String, title: String): String {
+            val prefix = when {
+                episodeNumber > 0f -> {
+                    if (episodeNumber % 1f == 0f) "E${episodeNumber.toInt()}" else "E$episodeNumber"
+                }
+                episodeLabel.isNotBlank() && episodeLabel != "0" -> "E$episodeLabel"
+                else -> null
+            }
+            return when {
+                prefix == null -> title
+                title.isBlank() -> prefix
+                else -> "$prefix - $title"
+            }
+        }
+
+        internal fun formatGenres(categories: List<String>): String? {
+            if (categories.isEmpty()) return null
+            return categories.mapNotNull { raw ->
+                val clean = raw.trim().lowercase()
+                if (clean.isBlank()) {
+                    null
+                } else if (clean == "sci-fi" || clean == "sci_fi") {
+                    "Sci-Fi"
+                } else {
+                    clean.split('_', '-').filter { it.isNotBlank() }.joinToString(" ") { word ->
+                        word.replaceFirstChar { ch -> ch.uppercaseChar() }
+                    }
+                }
+            }.distinct().joinToString(", ").ifBlank { null }
+        }
+
+        internal fun formatAudioSummary(versions: List<EpisodeVersion>, fallbackLocale: String): String {
+            val distinctLocales = versions.mapNotNull { it.audio_locale.ifBlank { null } }.distinct()
+            if (distinctLocales.isEmpty()) return "Audio: $fallbackLocale"
+            val primary = versions.firstOrNull { it.original }?.audio_locale?.ifBlank { null } ?: distinctLocales.first()
+            val dubCount = (distinctLocales.size - 1).coerceAtLeast(0)
+            return if (dubCount > 0) {
+                "Audio: $primary (+$dubCount dub${if (dubCount == 1) "" else "s"})"
+            } else {
+                "Audio: $primary"
+            }
+        }
     }
 }
