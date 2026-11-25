@@ -880,9 +880,14 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
     // ============================== Settings ==============================
 
+    private fun clearPlaybackCaches() {
+        playbackCache.clear()
+        resolutionCache.clear()
+        failedTargets.clear()
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val context = screen.context
-        val scope = CoroutineScope(Dispatchers.IO)
 
         fun getAccountSummary(): String {
             return if (auth.isUserLoggedIn()) {
@@ -925,6 +930,17 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                 return "${p.profileName}$primary$lock"
             }
 
+            fun applyProfilesToPreference(profilePref: ListPreference, profiles: List<CrProfile>) {
+                profilePref.entries = profiles.map { formatProfileLabel(it) }.toTypedArray()
+                profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
+                val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
+                if (active != null) {
+                    profilePref.value = active.profileId
+                    profilePref.summary = "Current: ${active.profileName}"
+                }
+                accountPref.summary = getAccountSummary()
+            }
+
             val profilePref = ListPreference(context).apply {
                 key = MiruRollAuth.PREF_ACTIVE_PROFILE
                 title = "Active Profile"
@@ -950,9 +966,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                                 summary = "Current: ${switched.profileName}"
                                 value = switched.profileId
                                 accountPref.summary = getAccountSummary()
-                                playbackCache.clear()
-                                resolutionCache.clear()
-                                failedTargets.clear()
+                                clearPlaybackCaches()
                                 Toast.makeText(context, "Switched profile to ${switched.profileName}", Toast.LENGTH_SHORT).show()
                             }.onFailure { err ->
                                 Toast.makeText(context, "Failed to switch profile: ${err.message}", Toast.LENGTH_LONG).show()
@@ -996,15 +1010,8 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
                             auth.fetchProfiles()
                         }.onSuccess { profiles ->
                             withContext(Dispatchers.Main) {
-                                profilePref.entries = profiles.map { formatProfileLabel(it) }.toTypedArray()
-                                profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
-                                val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
-                                if (active != null) {
-                                    profilePref.value = active.profileId
-                                    profilePref.summary = "Current: ${active.profileName}"
-                                }
+                                applyProfilesToPreference(profilePref, profiles)
                                 summary = "Reload profile list from Crunchyroll"
-                                accountPref.summary = getAccountSummary()
                                 Toast.makeText(context, "Profiles refreshed (${profiles.size} found)", Toast.LENGTH_SHORT).show()
                             }
                         }.onFailure { err ->
@@ -1022,14 +1029,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             scope.launch {
                 runCatching { auth.fetchProfiles() }.onSuccess { profiles ->
                     withContext(Dispatchers.Main) {
-                        profilePref.entries = profiles.map { formatProfileLabel(it) }.toTypedArray()
-                        profilePref.entryValues = profiles.map { it.profileId }.toTypedArray()
-                        val active = profiles.find { it.isSelected } ?: profiles.firstOrNull()
-                        if (active != null) {
-                            profilePref.value = active.profileId
-                            profilePref.summary = "Current: ${active.profileName}"
-                            accountPref.summary = getAccountSummary()
-                        }
+                        applyProfilesToPreference(profilePref, profiles)
                     }
                 }
             }
@@ -1043,6 +1043,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             dialogTitle = "Enter MiruRoll Email"
             setOnPreferenceChangeListener { _, _ ->
                 auth.clearSession()
+                clearPlaybackCaches()
                 true
             }
         }.also(screen::addPreference)
@@ -1058,6 +1059,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             dialogTitle = "Enter Password"
             setOnPreferenceChangeListener { _, _ ->
                 auth.clearSession()
+                clearPlaybackCaches()
                 true
             }
         }.also(screen::addPreference)
@@ -1069,12 +1071,13 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
             dialogTitle = "Enter Refresh Token"
             setOnPreferenceChangeListener { _, _ ->
                 auth.clearSession()
+                clearPlaybackCaches()
                 true
             }
         }.also(screen::addPreference)
     }
 
-    private companion object {
+    internal companion object {
         private const val TAG = "MiruRoll"
         private const val PAGE_SIZE = 24
         private const val PLAYBACK_CACHE_TTL_MS = 5 * 60_000L

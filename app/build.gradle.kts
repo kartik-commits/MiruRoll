@@ -63,4 +63,10 @@ dependencies {
     compileOnly("com.squareup.okhttp3:okhttp:5.0.0-alpha.14")
     compileOnly("androidx.preference:preference:1.2.1")
     compileOnly("com.github.mihonapp:injekt:91edab2317")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.github.kartik-commits:extensions-lib:18")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    testImplementation("com.squareup.okhttp3:okhttp:5.0.0-alpha.14")
+    testImplementation("androidx.preference:preference:1.2.1")
 }
