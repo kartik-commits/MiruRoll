@@ -381,15 +381,40 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     private val cachedAuthEpoch = AtomicLong(-1L)
     private val failedTargets = ConcurrentHashMap<String, Long>()
     private val playbackCache = ConcurrentHashMap<String, CachedPlayback>()
+    private val playbackSessionManager by lazy {
+        MiruRollPlaybackSessionManager(
+            client = client,
+            json = json,
+            scope = scope,
+            onTokenInvalidated = ::evictCachedToken,
+        )
+    }
 
     private fun invalidateCachesIfAuthChanged() {
         val currentEpoch = auth.getAuthEpoch()
         val prevEpoch = cachedAuthEpoch.getAndSet(currentEpoch)
         if (prevEpoch != -1L && prevEpoch != currentEpoch) {
-            playbackCache.clear()
-            resolutionCache.clear()
-            failedTargets.clear()
+            clearPlaybackCaches()
         }
+    }
+
+    private fun evictCachedToken(videoToken: String) {
+        playbackCache.entries.removeIf { it.value.response.token == videoToken }
+    }
+
+    /** Called by Animiru when Media3 playback pauses or enters background suspension. */
+    fun onPlaybackPaused() {
+        playbackSessionManager.onPlaybackPaused()
+    }
+
+    /** Called by Animiru when Media3 playback resumes with the current playhead position. */
+    fun onPlaybackResumed(positionSeconds: Long) {
+        playbackSessionManager.onPlaybackResumed(positionSeconds)
+    }
+
+    /** Called by Animiru when playback stops or exits so the Crunchyroll token lease is released. */
+    fun onPlaybackStopped() {
+        playbackSessionManager.onPlaybackStopped()
     }
 
     private fun resolveTargetVersion(epData: MiruEpisodeData): EpisodeVersion? {
@@ -662,6 +687,12 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
 
         if (!nonNullParsed.token.isNullOrBlank()) {
             drmHeadersBuilder.add("X-Cr-Video-Token", nonNullParsed.token)
+            Log.d(TAG, "Resolved playback session for contentId=$resolvedTargetId")
+            playbackSessionManager.startSession(
+                contentId = resolvedTargetId,
+                videoToken = nonNullParsed.token,
+                initialSession = nonNullParsed.session,
+            )
         }
 
         val drm = VideoDrm(
@@ -764,6 +795,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
         fetchBestPlayhead(episodeUrl)?.fullyWatched == true
 
     fun savePlayhead(episodeUrl: String, positionSeconds: Long, totalSeconds: Long, onComplete: Boolean) {
+        playbackSessionManager.noteProgress(positionSeconds, onComplete)
         if (!preferences.getBoolean("cr_pref_sync_history", true)) return
         if (!auth.isUserLoggedIn()) return
         val epData = runCatching {
@@ -881,6 +913,7 @@ class MiruRoll : ConfigurableAnimeSource, AnimeHttpSource() {
     // ============================== Settings ==============================
 
     private fun clearPlaybackCaches() {
+        playbackSessionManager.onPlaybackStopped()
         playbackCache.clear()
         resolutionCache.clear()
         failedTargets.clear()

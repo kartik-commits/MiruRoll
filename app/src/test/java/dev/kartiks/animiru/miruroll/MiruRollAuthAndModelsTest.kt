@@ -86,6 +86,31 @@ class MiruRollAuthAndModelsTest {
     }
 
     @Test
+    fun `PlaybackV4Response deserializes token and session state`() {
+        val raw = """
+            {
+              "url": "https://example.com/manifest.mpd",
+              "audioLocale": "ja-JP",
+              "token": "vid-tok-123",
+              "session": {
+                "renewSeconds": 30,
+                "noNetworkRetryIntervalSeconds": 10,
+                "noNetworkTimeoutSeconds": 300,
+                "maximumPauseSeconds": 600,
+                "sessionExpirationSeconds": 14400,
+                "endOfVideoUnloadSeconds": 60,
+                "usesStreamLimits": true
+              }
+            }
+        """.trimIndent()
+        val parsed = json.decodeFromString<PlaybackV4Response>(raw)
+        assertEquals("vid-tok-123", parsed.token)
+        assertEquals(30, parsed.session?.renewSeconds)
+        assertEquals(600, parsed.session?.maximumPauseSeconds)
+        assertEquals(true, parsed.session?.usesStreamLimits)
+    }
+
+    @Test
     fun `SelectFilter selectedValue guards out-of-bounds state`() {
         val sortFilter = MiruRollFilters.SortFilter()
         sortFilter.state = 99

@@ -238,11 +238,23 @@ data class EpisodeVersion(
 )
 
 @Serializable
+data class PlaybackSessionState(
+    val renewSeconds: Int = 60,
+    val noNetworkRetryIntervalSeconds: Int = 30,
+    val noNetworkTimeoutSeconds: Int = 370,
+    val maximumPauseSeconds: Int = 0,
+    val sessionExpirationSeconds: Int = 0,
+    val endOfVideoUnloadSeconds: Int = 0,
+    val usesStreamLimits: Boolean = false,
+)
+
+@Serializable
 data class PlaybackV4Response(
     val url: String = "",
     @SerialName("audioLocale")
     val audioLocale: String = "ja-JP",
     val token: String? = null,
+    val session: PlaybackSessionState? = null,
     val drm: DrmEntry? = null,
     val drms: List<DrmEntry>? = null,
     val subtitles: Map<String, PlaybackSubtitle>? = null,
